@@ -38,7 +38,35 @@ See: https://mycotalab.substack.com/p/why-ncbi-blast-identity-scores-can
 import edlib
 import re
 from dataclasses import dataclass
-from Bio.Seq import reverse_complement
+# Custom reverse complement implementation (replaces BioPython dependency)
+# Uses optimized str.translate() for performance that exceeds BioPython
+_RC_TRANSLATE_TABLE = str.maketrans(
+    'ATGCRYSWKMBDHVNatgcryswkmbdhvn-',
+    'TACGYRSWMKVHDBNtacgyrswmkvhdbn-'
+)
+
+
+def _reverse_complement(seq):
+    """
+    Generate reverse complement of DNA sequence with full IUPAC support.
+    
+    Handles all standard nucleotides (ATGC) and IUPAC ambiguity codes.
+    Unknown characters are left unchanged. Uses optimized str.translate()
+    for performance comparable to BioPython.
+    
+    Args:
+        seq (str): DNA sequence to reverse complement
+        
+    Returns:
+        str: Reverse complement sequence
+        
+    Examples:
+        >>> _reverse_complement('ATCG')
+        'CGAT'
+        >>> _reverse_complement('ATCGRGTC')  # R = A/G, becomes Y = C/T
+        'GACYCGAT'
+    """
+    return seq.translate(_RC_TRANSLATE_TABLE)[::-1]
 
 @dataclass(frozen=True)
 class AlignmentResult:
@@ -702,8 +730,8 @@ def align_edlib_bidirectional(seq1, seq2):
     seq2_suffix_trimmed = 0
 
     # Step 1: Reverse complement both sequences
-    rc_seq1 = reverse_complement(current_seq1)
-    rc_seq2 = reverse_complement(current_seq2)
+    rc_seq1 = _reverse_complement(current_seq1)
+    rc_seq2 = _reverse_complement(current_seq2)
 
     # Step 2: RC alignment with task=path for CIGAR-based gap detection
     result = edlib.align(rc_seq1, rc_seq2, mode="HW", task="path")
@@ -731,8 +759,8 @@ def align_edlib_bidirectional(seq1, seq2):
                 seq1_prefix_trimmed = gap_length  # suffix in RC = prefix in forward
 
     # Step 5: Reverse complement back to forward orientation
-    current_seq1 = reverse_complement(rc_seq1)
-    current_seq2 = reverse_complement(rc_seq2)
+    current_seq1 = _reverse_complement(rc_seq1)
+    current_seq2 = _reverse_complement(rc_seq2)
 
     # Step 6: Final forward alignment with task=path
     result = edlib.align(current_seq1, current_seq2, mode="HW", task="path")

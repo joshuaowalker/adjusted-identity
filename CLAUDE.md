@@ -122,7 +122,9 @@ The test suite is comprehensive and serves as documentation:
 
 The package requires:
 - `edlib>=1.3.9` - Fast sequence alignment library
-- `biopython>=1.80` - For sequence manipulation (Bio.Seq.reverse_complement)
+
+Previous versions required BioPython, but v0.1.2+ includes a custom reverse complement
+implementation with full IUPAC support, eliminating this heavyweight dependency.
 
 Development dependencies:
 - `pytest>=7.0.0` - Testing framework

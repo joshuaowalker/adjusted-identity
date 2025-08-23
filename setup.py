@@ -16,7 +16,7 @@ def read_readme():
 
 setup(
     name="adjusted-identity",
-    version="0.1.1",
+    version="0.1.2",
     author="Josh Walker",
     author_email="joshowalker@yahoo.com",
     description="Adjusted Identity Calculator for DNA Sequences with MycoBLAST-style preprocessing",
@@ -40,7 +40,6 @@ setup(
     python_requires=">=3.8",
     install_requires=[
         "edlib>=1.3.9",
-        "biopython>=1.80",
     ],
     extras_require={
         "dev": [

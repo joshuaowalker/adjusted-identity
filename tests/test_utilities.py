@@ -11,6 +11,7 @@ from adjusted_identity import (
     ScoringFormat,
     AlignmentResult,
     IUPAC_CODES,
+    _reverse_complement,
     _are_nucleotides_equivalent,
     _parse_suffix_gap_from_cigar,
     _find_scoring_region,
@@ -203,6 +204,152 @@ class TestScoringRegion:
         # Should account for gap positions
         assert start > 0
         assert end < len(seq1) - 1
+
+
+class TestReverseComplement:
+    """Test custom reverse complement implementation."""
+    
+    def test_standard_nucleotides(self):
+        """Test reverse complement of standard nucleotides."""
+        assert _reverse_complement('A') == 'T'
+        assert _reverse_complement('T') == 'A'
+        assert _reverse_complement('G') == 'C' 
+        assert _reverse_complement('C') == 'G'
+        
+        # Case variants
+        assert _reverse_complement('a') == 't'
+        assert _reverse_complement('t') == 'a'
+        assert _reverse_complement('g') == 'c'
+        assert _reverse_complement('c') == 'g'
+    
+    def test_standard_sequences(self):
+        """Test reverse complement of standard DNA sequences."""
+        assert _reverse_complement('ATCG') == 'CGAT'
+        assert _reverse_complement('AAATTT') == 'AAATTT'  # Palindrome
+        assert _reverse_complement('GCATGC') == 'GCATGC'  # Palindrome
+        assert _reverse_complement('ATCGATCG') == 'CGATCGAT'
+    
+    def test_iupac_ambiguity_codes(self):
+        """Test reverse complement of IUPAC ambiguity codes."""
+        # Purine/Pyrimidine exchange
+        assert _reverse_complement('R') == 'Y'  # AG -> CT
+        assert _reverse_complement('Y') == 'R'  # CT -> AG
+        
+        # Keto/Amino exchange  
+        assert _reverse_complement('K') == 'M'  # GT -> AC
+        assert _reverse_complement('M') == 'K'  # AC -> GT
+        
+        # Complement sets exchange
+        assert _reverse_complement('B') == 'V'  # CGT -> ACG
+        assert _reverse_complement('V') == 'B'  # ACG -> CGT
+        assert _reverse_complement('D') == 'H'  # AGT -> ACT
+        assert _reverse_complement('H') == 'D'  # ACT -> AGT
+        
+        # Palindromic codes (self-complementary)
+        assert _reverse_complement('S') == 'S'  # GC -> GC
+        assert _reverse_complement('W') == 'W'  # AT -> AT
+        assert _reverse_complement('N') == 'N'  # Any -> Any
+    
+    def test_case_variants(self):
+        """Test case variants of IUPAC codes."""
+        assert _reverse_complement('r') == 'y'
+        assert _reverse_complement('y') == 'r'
+        assert _reverse_complement('k') == 'm'
+        assert _reverse_complement('m') == 'k'
+        assert _reverse_complement('b') == 'v'
+        assert _reverse_complement('v') == 'b'
+        assert _reverse_complement('d') == 'h'
+        assert _reverse_complement('h') == 'd'
+        assert _reverse_complement('s') == 's'
+        assert _reverse_complement('w') == 'w'
+        assert _reverse_complement('n') == 'n'
+    
+    def test_mixed_case_sequences(self):
+        """Test sequences with mixed upper/lower case."""
+        assert _reverse_complement('AtCg') == 'cGaT'
+        assert _reverse_complement('ATCGRGTC') == 'GACYCGAT'
+        assert _reverse_complement('atcgrgtc') == 'gacycgat'
+    
+    def test_gaps_and_unknowns(self):
+        """Test gap characters and unknown characters."""
+        assert _reverse_complement('ATC-G') == 'C-GAT'
+        assert _reverse_complement('---') == '---'
+        
+        # Unknown characters pass through unchanged
+        assert _reverse_complement('ATCXG') == 'CXGAT'
+        assert _reverse_complement('AT@CG') == 'CG@AT'
+    
+    def test_roundtrip_property(self):
+        """Test that reverse complement of reverse complement gives original."""
+        test_sequences = [
+            'ATCG',
+            'ATCGATCGATCG',
+            'AAATTTGGGCCC',
+            'ATCGRGTC',    # With IUPAC codes
+            'RYSWKMBVDHN', # All IUPAC codes
+            'ryswkmbvdhn', # Lowercase
+            'ATC-G-TC',    # With gaps
+            'ATCXRYTC',    # With unknown character
+        ]
+        
+        for seq in test_sequences:
+            roundtrip = _reverse_complement(_reverse_complement(seq))
+            assert roundtrip == seq, f"Roundtrip failed for {seq}: got {roundtrip}"
+    
+    def test_empty_sequence(self):
+        """Test empty sequence."""
+        assert _reverse_complement('') == ''
+    
+    def test_single_characters(self):
+        """Test all single characters with known mappings."""
+        # Test known mappings directly
+        mappings = {
+            # Standard nucleotides
+            'A': 'T', 'T': 'A', 'G': 'C', 'C': 'G',
+            'a': 't', 't': 'a', 'g': 'c', 'c': 'g',
+            # IUPAC codes
+            'R': 'Y', 'Y': 'R', 'S': 'S', 'W': 'W',
+            'K': 'M', 'M': 'K', 'B': 'V', 'V': 'B',
+            'D': 'H', 'H': 'D', 'N': 'N', '-': '-',
+            'r': 'y', 'y': 'r', 's': 's', 'w': 'w',
+            'k': 'm', 'm': 'k', 'b': 'v', 'v': 'b', 
+            'd': 'h', 'h': 'd', 'n': 'n'
+        }
+        
+        for char, expected_complement in mappings.items():
+            assert _reverse_complement(char) == expected_complement
+            # Test roundtrip for all mapped characters
+            assert _reverse_complement(_reverse_complement(char)) == char
+    
+    def test_palindromic_sequences(self):
+        """Test sequences that are their own reverse complement."""
+        palindromes = [
+            'ATAT',
+            'GCGC', 
+            'AAATTT',
+            'CCCGGG',
+            'SWWS',   # IUPAC palindrome
+            'NWWN',   # Mixed IUPAC palindrome
+        ]
+        
+        for seq in palindromes:
+            assert _reverse_complement(seq) == seq, f"Palindrome test failed for {seq}"
+    
+    def test_biological_realism(self):
+        """Test with realistic biological sequences."""
+        # ITS-like sequence with common IUPAC codes
+        its_seq = "TCCGTAGGTGAACCTGCGGAAGGATCATTACCGAGTTTAAR"
+        rc_its = _reverse_complement(its_seq)
+        
+        # Should be same length
+        assert len(rc_its) == len(its_seq)
+        
+        # Should roundtrip correctly
+        assert _reverse_complement(rc_its) == its_seq
+        
+        # Manual check of a few positions
+        assert rc_its[0] == 'Y'  # Last R -> Y (at start of RC)
+        assert rc_its[-1] == 'A'  # First T -> A (at end of RC)
 
 
 class TestIUPACCodes:

@@ -513,6 +513,13 @@ BSD 2-Clause License - see [LICENSE](LICENSE) file for details.
 
 ## Changelog
 
+### Version 0.1.2
+- **Breaking**: Removed BioPython dependency - now only requires `edlib`
+- Implemented custom `reverse_complement()` function with full IUPAC support
+- Reduced package size and installation complexity
+- Added comprehensive test coverage for reverse complement functionality
+- Maintains 100% API compatibility (no code changes needed)
+
 ### Version 0.1.1
 - Added repeat motif adjustment support (dinucleotide and longer repeats)
 - Implemented intelligent motif length detection with degeneracy handling
