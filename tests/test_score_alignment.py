@@ -411,6 +411,184 @@ class TestCombinedAdjustments:
         assert result.mismatches == 1
 
 
+class TestRepeatMotifs:
+    """Test handling of dinucleotide and longer repeat motifs."""
+    
+    def test_dinucleotide_repeat_basic(self):
+        """Test basic AT dinucleotide repeat from Russell article."""
+        # Example from article: CGATATC vs CGATATATC (extra AT motif)
+        seq1 = "CGATAT--C"
+        seq2 = "CGATATATC"
+        
+        params = AdjustmentParams(max_repeat_motif_length=2)
+        result = score_alignment(seq1, seq2, params)
+        
+        # The AT insertion should be treated as repeat extension
+        assert result.identity == 1.0
+        assert result.mismatches == 0
+        assert '=' in result.score_aligned  # Should have repeat extension markers
+    
+    def test_dinucleotide_repeat_multiple(self):
+        """Test multiple dinucleotide repeat units."""
+        # Two extra AT units
+        seq1 = "CGATAT----C"
+        seq2 = "CGATATATATC"
+        
+        params = AdjustmentParams(max_repeat_motif_length=2)
+        result = score_alignment(seq1, seq2, params)
+        
+        assert result.identity == 1.0
+        assert result.mismatches == 0
+        assert result.score_aligned.count('=') == 4  # Four repeat extension positions
+    
+    def test_mixed_motif_lengths(self):
+        """Test indel with different left and right motif lengths."""
+        # Left side: AT repeat (length 2)
+        # Middle: C (not a repeat)
+        # Right side: single G homopolymer (length 1)
+        seq1 = "ATAT----GGG"
+        seq2 = "ATATATCGGGG"
+        
+        params = AdjustmentParams(max_repeat_motif_length=2)
+        result = score_alignment(seq1, seq2, params)
+        
+        # AT on left (extension), C in middle (regular indel), G on right (homopolymer extension)
+        assert result.identity < 1.0  # Middle C is a mismatch
+        assert '=' in result.score_aligned  # AT and G extensions
+        assert ' ' in result.score_aligned or '-' in result.score_aligned  # Regular indel for C
+    
+    def test_degenerate_dinucleotide_as_homopolymer(self):
+        """Test that AA/TT/CC/GG are treated as homopolymers, not dinucleotides."""
+        # "AA" should be treated as homopolymer 'A', not dinucleotide "AA"
+        seq1 = "CGAAA----TC"
+        seq2 = "CGAAAAAA-TC"
+        
+        params = AdjustmentParams(max_repeat_motif_length=2)
+        result = score_alignment(seq1, seq2, params)
+        
+        # Should treat as homopolymer extension
+        assert result.identity == 1.0
+        assert result.mismatches == 0
+        assert '=' in result.score_aligned
+    
+    def test_partial_motif_not_consumed(self):
+        """Test that partial motifs are not consumed as extensions."""
+        # "ATA" where motif is "AT" - should only consume "AT", leave "A"
+        seq1 = "ATAT---C"
+        seq2 = "ATATATAC"
+        
+        params = AdjustmentParams(max_repeat_motif_length=2)
+        result = score_alignment(seq1, seq2, params)
+        
+        # The final "A" should be a regular indel, not extension
+        assert result.identity < 1.0
+        assert result.mismatches == 1  # The "A" counts as mismatch
+    
+    def test_no_matching_context(self):
+        """Test indel with no repeat context."""
+        # No repeating pattern
+        seq1 = "ATCG---TGCA"
+        seq2 = "ATCGACGTGCA"
+        
+        params = AdjustmentParams(max_repeat_motif_length=2)
+        result = score_alignment(seq1, seq2, params)
+        
+        # Should be treated as regular indel
+        assert result.identity < 1.0
+        assert '=' not in result.score_aligned  # No repeat extensions
+    
+    def test_trinucleotide_with_max_length_2(self):
+        """Test that trinucleotide repeats are not detected when max_length=2."""
+        # CAG repeat, but max_repeat_motif_length=2
+        seq1 = "CAGCAG---TTC"
+        seq2 = "CAGCAGCAGTTC"
+        
+        params = AdjustmentParams(max_repeat_motif_length=2)
+        result = score_alignment(seq1, seq2, params)
+        
+        # Should not detect CAG repeat (length 3 > max 2)
+        assert result.identity < 1.0
+        assert result.mismatches > 0
+    
+    def test_both_sides_same_dinucleotide(self):
+        """Test indel with same dinucleotide repeat on both sides."""
+        # AT repeat on both sides of indel
+        seq1 = "ATAT------ATAT"
+        seq2 = "ATATATATATATAT"
+        
+        params = AdjustmentParams(max_repeat_motif_length=2)
+        result = score_alignment(seq1, seq2, params)
+        
+        # All should be AT extensions
+        assert result.identity == 1.0
+        assert result.mismatches == 0
+        assert result.score_aligned.count('=') == 6  # Six repeat extension positions
+    
+    def test_reverse_complement_motifs(self):
+        """Test different motifs that are reverse complements."""
+        # AT on left, TA on right (reverse complement)
+        seq1 = "ATAT--TATA"
+        seq2 = "ATATATTATA"
+        
+        params = AdjustmentParams(max_repeat_motif_length=2)
+        result = score_alignment(seq1, seq2, params)
+        
+        # Should handle both independently
+        assert result.identity == 1.0
+        assert '=' in result.score_aligned
+    
+    def test_motif_at_sequence_boundary(self):
+        """Test repeat motif at the very start or end of sequence."""
+        # AT repeat at start
+        seq1 = "--ATATGC"
+        seq2 = "ATATATGC"
+        
+        params = AdjustmentParams(max_repeat_motif_length=2)
+        result = score_alignment(seq1, seq2, params)
+        
+        # No left context, but should still work with right context
+        assert '=' in result.score_aligned or ' ' in result.score_aligned
+    
+    def test_complex_mixed_indel(self):
+        """Test complex indel with both repeat extensions and regular content."""
+        # Left: AT repeat, Middle: CGT (non-repeat), Right: G homopolymer
+        seq1 = "ATAT-------GGG"
+        seq2 = "ATATATATCGTGGG"
+        
+        params = AdjustmentParams(max_repeat_motif_length=2)
+        result = score_alignment(seq1, seq2, params)
+        
+        # Should have both extensions (=) and regular indel ( -)
+        assert '=' in result.score_aligned  # Extensions
+        assert ' ' in result.score_aligned or '-' in result.score_aligned  # Regular indel
+    
+    def test_motif_length_disabled(self):
+        """Test that setting max_repeat_motif_length=1 disables dinucleotide detection."""
+        # AT repeat that should not be detected
+        seq1 = "ATAT--C"
+        seq2 = "ATATATC"
+        
+        params = AdjustmentParams(max_repeat_motif_length=1)  # Only homopolymers
+        result = score_alignment(seq1, seq2, params)
+        
+        # Should treat as regular indel
+        assert result.identity < 1.0
+        assert result.mismatches > 0
+    
+    def test_overlapping_motif_possibilities(self):
+        """Test sequence where multiple motif lengths could apply."""
+        # AAAA could be: "AAAA" (length 4), "AA" (length 2), or "A" (length 1)
+        seq1 = "AAAA----TTTT"
+        seq2 = "AAAAAAAATTTT"
+        
+        params = AdjustmentParams(max_repeat_motif_length=2)
+        result = score_alignment(seq1, seq2, params)
+        
+        # Should detect as homopolymer (length 1) due to degeneracy check
+        assert result.identity == 1.0
+        assert '=' in result.score_aligned
+
+
 class TestEdgeCases:
     """Test edge cases and error conditions."""
     

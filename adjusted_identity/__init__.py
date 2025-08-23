@@ -98,11 +98,14 @@ class AdjustmentParams:
         end_skip_distance: Number of nucleotides (not positions) to skip from each sequence end.
                           Only activates when sequences have ≥ 2×end_skip_distance nucleotides.
                           Set to 0 to disable end trimming completely.
+        max_repeat_motif_length: Maximum length of repeat motifs to detect (e.g., 2 for dinucleotides).
+                                Set to 1 to only detect homopolymers, 2 for dinucleotides, etc.
     """
     normalize_homopolymers: bool = True      # Ignore homopolymer length differences
     handle_iupac_overlap: bool = True        # Allow different ambiguity codes to match via intersection
     normalize_indels: bool = True            # Count contiguous indels as single events
     end_skip_distance: int = 20              # Nucleotides to skip from each end (0 to disable)
+    max_repeat_motif_length: int = 2         # Maximum repeat motif length to detect (default: dinucleotides)
 
 
 # Default adjustment parameters (all adjustments enabled)
@@ -277,19 +280,19 @@ def _find_scoring_region(seq1_aligned, seq2_aligned, end_skip_distance):
 
 
 
-def _process_indel_left_right(seq1_aligned, seq2_aligned, start, end, adjustment_params, scoring_format, context_length=1):
+def _process_indel_left_right(seq1_aligned, seq2_aligned, start, end, adjustment_params, scoring_format):
     """
-    Process an indel region using left-right homopolymer extension algorithm.
+    Process an indel region using left-right repeat motif/homopolymer extension algorithm.
     
     This implements the general case algorithm that can handle mixed indels
-    by processing homopolymer extensions from both ends, leaving only the
-    non-homopolymer content to be treated as regular indels.
+    by processing repeat motif or homopolymer extensions from both ends, leaving only the
+    non-repeat content to be treated as regular indels.
     
     Algorithm:
     1. Extract the full indel content
-    2. Extract left and right contexts from the gapped sequence
-    3. Process left side: consume indel chars that match left context
-    4. Process right side: consume indel chars that match right context  
+    2. For left side: try different context lengths to find repeat motifs
+    3. For right side: independently try different context lengths  
+    4. Process extensions based on detected motif lengths
     5. Generate scoring string and counts based on adjustment parameters
     
     Args:
@@ -297,14 +300,13 @@ def _process_indel_left_right(seq1_aligned, seq2_aligned, start, end, adjustment
         start, end: Start/end positions of indel region (inclusive)
         adjustment_params: AdjustmentParams controlling how to handle different components
         scoring_format: ScoringFormat for generating visualization symbols
-        context_length: Length of context to check (1 for homopolymer, >1 for motifs)
         
     Returns:
         dict: {
             'score_string': str - scoring visualization for this indel region,
             'edits': int - number of edits to count,
             'scored_positions': int - number of positions to add to denominator,
-            'all_homopolymer': bool - True if entire indel is homopolymer extension
+            'all_homopolymer': bool - True if entire indel is homopolymer/repeat extension
         }
     """
     # Extract indel characters in order
@@ -331,54 +333,92 @@ def _process_indel_left_right(seq1_aligned, seq2_aligned, start, end, adjustment
     gap_in_seq1 = (seq1_aligned[start] == '-')
     context_seq = seq2_aligned if gap_in_seq1 else seq1_aligned
     
-    # Extract contexts
-    left_context = None
-    if start >= context_length:
-        left_context = context_seq[start - context_length:start]
+    # LEFT SIDE PROCESSING - Try different context lengths
+    left_repeat_count = 0
+    left_context_length = 0
+    max_motif_length = adjustment_params.max_repeat_motif_length
     
-    right_context = None  
-    if end + context_length < len(context_seq):
-        right_context = context_seq[end + 1:end + 1 + context_length]
+    for try_length in range(min(max_motif_length, start), 0, -1):
+        if start >= try_length:
+            left_context = context_seq[start - try_length:start]
+            
+            # Check for degenerate case (homopolymer disguised as longer motif)
+            if len(set(left_context)) == 1:
+                # It's actually a homopolymer, use length 1
+                left_context = left_context[0]
+                actual_length = 1
+            else:
+                actual_length = try_length
+            
+            # Count how many complete motifs we can consume from left
+            consumed = 0
+            while consumed + actual_length <= len(indel_chars):
+                if actual_length == 1:
+                    # Single character comparison
+                    if indel_chars[consumed] == left_context:
+                        consumed += 1
+                    else:
+                        break
+                else:
+                    # Multi-character motif comparison
+                    chunk = ''.join(indel_chars[consumed:consumed + actual_length])
+                    if chunk == left_context:
+                        consumed += actual_length
+                    else:
+                        break
+            
+            if consumed > 0:
+                left_repeat_count = consumed
+                left_context_length = actual_length
+                break  # Found a working context length
     
-    # Process left side
-    left_consumed_count = 0
-    current_context = left_context
+    # RIGHT SIDE PROCESSING - Independent of left side
+    right_repeat_count = 0
+    right_context_length = 0
     
-    while (left_consumed_count < len(indel_chars) and 
-           current_context and
-           len(current_context) == context_length and
-           indel_chars[left_consumed_count] == current_context[-1]):  # Match last char of context
-        
-        # Consume this character
-        consumed_char = indel_chars[left_consumed_count] 
-        left_consumed_count += 1
-        
-        # Update context: shift left and add consumed character
-        current_context = current_context[1:] + consumed_char
+    # Calculate remaining indel after left consumption
+    remaining_start = left_repeat_count
+    remaining_chars = indel_chars[remaining_start:]
     
-    # Process right side on remaining characters
-    remaining_chars = indel_chars[left_consumed_count:]
-    remaining_positions = indel_positions[left_consumed_count:]
+    for try_length in range(min(max_motif_length, len(context_seq) - end - 1), 0, -1):
+        if end + try_length < len(context_seq):
+            right_context = context_seq[end + 1:end + 1 + try_length]
+            
+            # Check for degenerate case
+            if len(set(right_context)) == 1:
+                right_context = right_context[0]
+                actual_length = 1
+            else:
+                actual_length = try_length
+            
+            # Count from right side of remaining indel
+            consumed = 0
+            pos = len(remaining_chars)
+            
+            while pos >= actual_length:
+                if actual_length == 1:
+                    # Single character comparison
+                    if remaining_chars[pos - 1] == right_context:
+                        consumed += 1
+                        pos -= 1
+                    else:
+                        break
+                else:
+                    # Multi-character motif comparison
+                    chunk = ''.join(remaining_chars[pos - actual_length:pos])
+                    if chunk == right_context:
+                        consumed += actual_length
+                        pos -= actual_length
+                    else:
+                        break
+            
+            if consumed > 0:
+                right_repeat_count = consumed
+                right_context_length = actual_length
+                break
     
-    right_consumed_count = 0
-    current_context = right_context
-    
-    while (right_consumed_count < len(remaining_chars) and
-           current_context and 
-           len(current_context) == context_length and
-           remaining_chars[-(right_consumed_count + 1)] == current_context[0]):  # Match first char of context
-        
-        # Consume this character from the right
-        consumed_char = remaining_chars[-(right_consumed_count + 1)]
-        right_consumed_count += 1
-        
-        # Update context: shift right and add consumed character  
-        current_context = consumed_char + current_context[:-1]
-    
-    # Determine the three components: left repeats + middle indel + right repeats
-    left_repeat_count = left_consumed_count
-    right_repeat_count = right_consumed_count
-    middle_indel_count = len(indel_chars) - left_consumed_count - right_consumed_count
+    # Calculate middle (non-repeat) portion
+    middle_indel_count = len(indel_chars) - left_repeat_count - right_repeat_count
     
     all_homopolymer = (middle_indel_count == 0)
     
@@ -591,7 +631,7 @@ def score_alignment(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_
             # Process indel using left-right homopolymer extension algorithm
             indel_result = _process_indel_left_right(
                 seq1_aligned, seq2_aligned, indel_start, indel_end, 
-                adjustment_params, scoring_format, context_length=1
+                adjustment_params, scoring_format
             )
             
             # Add results from indel processing

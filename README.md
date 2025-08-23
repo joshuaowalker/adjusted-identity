@@ -7,13 +7,12 @@ A Python package implementing MycoBLAST-style sequence identity calculations for
 ## Features
 
 - **Homopolymer Length Normalization**: Ignore differences in homopolymer run lengths (e.g., "AAA" vs "AAAA")
+- **Repeat Motif Adjustment**: Handle dinucleotide and longer repeat motifs (e.g., "ATATAT" vs "ATATATAT")
 - **IUPAC Ambiguity Code Handling**: Allow different ambiguity codes to match via nucleotide intersection
 - **End Trimming**: Skip mismatches in terminal regions to avoid sequencing artifacts (automatic for sequences >40bp)
 - **Indel Normalization**: Count contiguous indels as single evolutionary events
 - **Comprehensive Alignment**: Multi-stage bidirectional alignment optimization using edlib
 - **Flexible Configuration**: Enable/disable individual adjustments as needed
-
-> **Note**: Repeating motif adjustment (as described in the MycoBLAST algorithm) is not yet implemented in this version.
 
 ## Installation
 
@@ -101,6 +100,26 @@ result = align_and_score(barcode1, barcode2)
 print(f"Identity with IUPAC handling: {result.identity:.3f}")  # Should be 1.0
 ```
 
+### Repeat Motif Handling
+
+```python
+from adjusted_identity import align_and_score, AdjustmentParams
+
+# Dinucleotide repeat differences (AT repeat from Russell article)
+seq1 = "CGATAT--C"  # Missing one AT unit
+seq2 = "CGATATATC"  # Has extra AT unit
+
+# With repeat motif adjustment (default)
+result = align_and_score(seq1, seq2)
+print(f"Adjusted identity: {result.identity:.3f}")  # Should be 1.0
+
+# Control max repeat motif length
+params = AdjustmentParams(
+    max_repeat_motif_length=3  # Detect up to trinucleotide repeats (e.g., CAG)
+)
+result = align_and_score("CAGCAG---TTC", "CAGCAGCAGTTC", params)
+```
+
 ### Custom Adjustments
 
 ```python
@@ -111,7 +130,8 @@ custom_params = AdjustmentParams(
     normalize_homopolymers=True,   # Enable homopolymer adjustment
     handle_iupac_overlap=False,    # Disable IUPAC intersection
     normalize_indels=True,         # Enable indel normalization
-    end_skip_distance=10          # Skip 10bp from each end (instead of default 20)
+    end_skip_distance=10,         # Skip 10bp from each end (instead of default 20)
+    max_repeat_motif_length=2     # Detect up to dinucleotide repeats (default)
 )
 
 result = align_and_score(seq1, seq2, custom_params)
@@ -206,7 +226,8 @@ AdjustmentParams(
     normalize_homopolymers=True,    # Ignore homopolymer length differences
     handle_iupac_overlap=True,      # Allow IUPAC ambiguity intersections
     normalize_indels=True,          # Count contiguous indels as single events
-    end_skip_distance=20           # Skip first/last N nucleotides (not positions) from scoring
+    end_skip_distance=20,          # Skip first/last N nucleotides (not positions) from scoring
+    max_repeat_motif_length=2      # Maximum repeat motif length to detect (1=homopolymers only, 2=dinucleotides, etc.)
 )
 ```
 
@@ -492,8 +513,15 @@ BSD 2-Clause License - see [LICENSE](LICENSE) file for details.
 
 ## Changelog
 
+### Version 0.1.1
+- Added repeat motif adjustment support (dinucleotide and longer repeats)
+- Implemented intelligent motif length detection with degeneracy handling
+- Added `max_repeat_motif_length` parameter to AdjustmentParams
+- Enhanced left-right indel processing algorithm for mixed motif lengths
+- Added comprehensive test coverage for repeat motif scenarios
+
 ### Version 0.1.0
 - Initial release
-- Complete MycoBLAST-style adjustment implementation
+- Complete MycoBLAST-style adjustment implementation (except repeat motifs)
 - Comprehensive test suite
 - Full documentation and examples
