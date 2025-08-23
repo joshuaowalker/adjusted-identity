@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Copyright (c) 2025, Josh Walker
-All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
@@ -31,6 +30,9 @@ account for homopolymer length differences, commonly used in mycological
 DNA barcoding applications.
 
 Author: Josh Walker
+
+Based on the MycoBLAST algorithm developed by Stephen Russell and Mycota Lab.
+See: https://mycotalab.substack.com/p/why-ncbi-blast-identity-scores-can
 """
 
 import edlib
