@@ -88,11 +88,21 @@ class ScoringFormat:
 
 @dataclass(frozen=True)
 class AdjustmentParams:
-    """Parameters for MycoBLAST-style sequence adjustments."""
+    """
+    Parameters for MycoBLAST-style sequence adjustments.
+    
+    Attributes:
+        normalize_homopolymers: Ignore homopolymer length differences (e.g., "AAA" vs "AAAA")
+        handle_iupac_overlap: Allow different ambiguity codes to match via nucleotide intersection
+        normalize_indels: Count contiguous indels as single evolutionary events
+        end_skip_distance: Number of nucleotides (not positions) to skip from each sequence end.
+                          Only activates when sequences have ≥ 2×end_skip_distance nucleotides.
+                          Set to 0 to disable end trimming completely.
+    """
     normalize_homopolymers: bool = True      # Ignore homopolymer length differences
     handle_iupac_overlap: bool = True        # Allow different ambiguity codes to match via intersection
     normalize_indels: bool = True            # Count contiguous indels as single events
-    end_skip_distance: int = 20              # Distance from ends to skip mismatches (0 to disable)
+    end_skip_distance: int = 20              # Nucleotides to skip from each end (0 to disable)
 
 
 # Default adjustment parameters (all adjustments enabled)
@@ -209,15 +219,33 @@ def _find_scoring_region(seq1_aligned, seq2_aligned, end_skip_distance):
     """
     Find the [start, end] region of the alignment where mismatches should be counted.
     
-    Implements MycoBLAST "digital end trimming" by skipping the first/last end_skip_distance bp
-    from each sequence to avoid counting sequencing artifacts near read ends.
+    Implements MycoBLAST "digital end trimming" by skipping the first/last end_skip_distance
+    nucleotides (not alignment positions) from each sequence to avoid counting sequencing 
+    artifacts near read ends.
+    
+    IMPORTANT: This function counts NUCLEOTIDES (non-gap characters), not alignment positions.
+    End trimming only activates when both sequences have >= end_skip_distance nucleotides
+    available to skip from each end.
+    
+    Behavior:
+    - Short sequences (< 2×end_skip_distance nucleotides): Returns full range [0, len-1]
+    - Long sequences (≥ 2×end_skip_distance nucleotides): Returns trimmed range excluding ends
+    - Gap characters ('-') are ignored when counting nucleotides
+    
+    Example:
+        seq1_aligned = "AAAA-TCGX-TTTT"  # 12 nucleotides, 14 alignment positions
+        seq2_aligned = "-AAAATCGA-TTTT"  # 12 nucleotides, 14 alignment positions
+        end_skip_distance = 3
+        
+        Result: Skip first 3 and last 3 nucleotides from each sequence
+        → scoring_start=4, scoring_end=9 (positions where middle nucleotides align)
     
     Args:
-        seq1_aligned, seq2_aligned: Aligned sequences with gaps
-        end_skip_distance: Distance from ends to skip mismatches (typically 20bp)
+        seq1_aligned, seq2_aligned: Aligned sequences with gaps (must be same length)
+        end_skip_distance: Number of nucleotides to skip from each end (typically 20)
         
     Returns:
-        tuple: (scoring_start, scoring_end) - inclusive range to score mismatches
+        tuple: (scoring_start, scoring_end) - inclusive range of alignment positions to score
     """
     alignment_length = len(seq1_aligned)
     
@@ -249,67 +277,181 @@ def _find_scoring_region(seq1_aligned, seq2_aligned, end_skip_distance):
 
 
 
-def _is_homopolymer_extension(seq1_aligned, seq2_aligned, start, end):
+def _process_indel_left_right(seq1_aligned, seq2_aligned, start, end, adjustment_params, scoring_format, context_length=1):
     """
-    Determine if an indel region represents a homopolymer length extension.
-
-    A homopolymer extension occurs when one sequence has a longer run of
-    identical nucleotides compared to the other. For example:
-    - "AAATTT" vs "AAAATTT" (extra A extends the A homopolymer)
-    - "GGCCCC" vs "GGCCC" (missing C shortens the C homopolymer)
-
-    Args:
-        seq1_aligned (str): first sequence with gaps
-        seq2_aligned (str): second sequence with gaps
-        start (int): Start position of indel region
-        end (int): End position of indel region (inclusive)
-
-    Returns:
-        bool: True if the indel represents a homopolymer extension
-    """
-    # Extract all non-gap characters from the indel region
-    indel_chars = []
-    for i in range(start, end + 1):
-        if seq1_aligned[i] != '-':
-            indel_chars.append(seq1_aligned[i])
-        if seq2_aligned[i] != '-':
-            indel_chars.append(seq2_aligned[i])
+    Process an indel region using left-right homopolymer extension algorithm.
     
-    # Must have indel characters and all must be the same nucleotide
-    if not indel_chars or len(set(indel_chars)) != 1:
-        return False
+    This implements the general case algorithm that can handle mixed indels
+    by processing homopolymer extensions from both ends, leaving only the
+    non-homopolymer content to be treated as regular indels.
     
-    # Check if this nucleotide extends a homopolymer in the surrounding context
-    indel_char = indel_chars[0]
-    return _check_homopolymer_context(seq1_aligned, seq2_aligned, start, end, indel_char)
-
-
-def _check_homopolymer_context(seq1_aligned, seq2_aligned, start, end, indel_char):
-    """
-    Check if an indel character extends a homopolymer in the surrounding context.
-    
-    For a true homopolymer extension, the indel character should appear adjacent 
-    to the indel region in both sequences (indicating different length runs of the same base).
+    Algorithm:
+    1. Extract the full indel content
+    2. Extract left and right contexts from the gapped sequence
+    3. Process left side: consume indel chars that match left context
+    4. Process right side: consume indel chars that match right context  
+    5. Generate scoring string and counts based on adjustment parameters
     
     Args:
         seq1_aligned, seq2_aligned: Aligned sequences with gaps
         start, end: Start/end positions of indel region (inclusive)
-        indel_char: The nucleotide being inserted/deleted
+        adjustment_params: AdjustmentParams controlling how to handle different components
+        scoring_format: ScoringFormat for generating visualization symbols
+        context_length: Length of context to check (1 for homopolymer, >1 for motifs)
         
     Returns:
-        bool: True if this extends a homopolymer in both sequences
+        dict: {
+            'score_string': str - scoring visualization for this indel region,
+            'edits': int - number of edits to count,
+            'scored_positions': int - number of positions to add to denominator,
+            'all_homopolymer': bool - True if entire indel is homopolymer extension
+        }
     """
-    # Extract characters before and after the indel region for each sequence
-    seq1_before = seq1_aligned[start - 1] if start > 0 else ''
-    seq1_after = seq1_aligned[end + 1] if end + 1 < len(seq1_aligned) else ''
-    seq2_before = seq2_aligned[start - 1] if start > 0 else ''
-    seq2_after = seq2_aligned[end + 1] if end + 1 < len(seq2_aligned) else ''
+    # Extract indel characters in order
+    indel_chars = []
+    indel_positions = []
     
-    # Check if the indel character appears adjacent to the indel in both sequences
-    seq1_has_context = indel_char in [seq1_before, seq1_after]
-    seq2_has_context = indel_char in [seq2_before, seq2_after]
+    for i in range(start, end + 1):
+        if seq1_aligned[i] != '-':
+            indel_chars.append(seq1_aligned[i])
+            indel_positions.append(i)
+        elif seq2_aligned[i] != '-':
+            indel_chars.append(seq2_aligned[i])
+            indel_positions.append(i)
     
-    return seq1_has_context and seq2_has_context
+    if not indel_chars:
+        return {
+            'score_string': '',
+            'edits': 0,
+            'scored_positions': 0,
+            'all_homopolymer': False
+        }
+    
+    # Determine which sequence has gaps (the context sequence)
+    gap_in_seq1 = (seq1_aligned[start] == '-')
+    context_seq = seq2_aligned if gap_in_seq1 else seq1_aligned
+    
+    # Extract contexts
+    left_context = None
+    if start >= context_length:
+        left_context = context_seq[start - context_length:start]
+    
+    right_context = None  
+    if end + context_length < len(context_seq):
+        right_context = context_seq[end + 1:end + 1 + context_length]
+    
+    # Process left side
+    left_consumed_count = 0
+    current_context = left_context
+    
+    while (left_consumed_count < len(indel_chars) and 
+           current_context and
+           len(current_context) == context_length and
+           indel_chars[left_consumed_count] == current_context[-1]):  # Match last char of context
+        
+        # Consume this character
+        consumed_char = indel_chars[left_consumed_count] 
+        left_consumed_count += 1
+        
+        # Update context: shift left and add consumed character
+        current_context = current_context[1:] + consumed_char
+    
+    # Process right side on remaining characters
+    remaining_chars = indel_chars[left_consumed_count:]
+    remaining_positions = indel_positions[left_consumed_count:]
+    
+    right_consumed_count = 0
+    current_context = right_context
+    
+    while (right_consumed_count < len(remaining_chars) and
+           current_context and 
+           len(current_context) == context_length and
+           remaining_chars[-(right_consumed_count + 1)] == current_context[0]):  # Match first char of context
+        
+        # Consume this character from the right
+        consumed_char = remaining_chars[-(right_consumed_count + 1)]
+        right_consumed_count += 1
+        
+        # Update context: shift right and add consumed character  
+        current_context = consumed_char + current_context[:-1]
+    
+    # Determine the three components: left repeats + middle indel + right repeats
+    left_repeat_count = left_consumed_count
+    right_repeat_count = right_consumed_count
+    middle_indel_count = len(indel_chars) - left_consumed_count - right_consumed_count
+    
+    all_homopolymer = (middle_indel_count == 0)
+    
+    # Score each component independently and sum results
+    total_edits = 0
+    total_scored_positions = 0
+    score_parts = []
+    
+    # 1. Score left repeat region (homopolymer extensions)
+    if left_repeat_count > 0:
+        if adjustment_params.normalize_homopolymers:
+            # Homopolymer extensions: no edits, no scored positions
+            left_edits = 0
+            left_scored_positions = 0
+            left_score = scoring_format.homopolymer_extension * left_repeat_count
+        else:
+            # Treat as regular indel
+            if adjustment_params.normalize_indels:
+                left_edits = 1
+                left_scored_positions = 1
+                left_score = scoring_format.indel_start + (scoring_format.indel_extension * (left_repeat_count - 1))
+            else:
+                left_edits = left_repeat_count
+                left_scored_positions = left_repeat_count
+                left_score = scoring_format.indel_start * left_repeat_count
+        
+        total_edits += left_edits
+        total_scored_positions += left_scored_positions
+        score_parts.append(left_score)
+    
+    # 2. Score middle indel region
+    if middle_indel_count > 0:
+        if adjustment_params.normalize_indels:
+            middle_edits = 1
+            middle_scored_positions = 1
+            middle_score = scoring_format.indel_start + (scoring_format.indel_extension * (middle_indel_count - 1))
+        else:
+            middle_edits = middle_indel_count
+            middle_scored_positions = middle_indel_count
+            middle_score = scoring_format.indel_start * middle_indel_count
+        
+        total_edits += middle_edits
+        total_scored_positions += middle_scored_positions
+        score_parts.append(middle_score)
+    
+    # 3. Score right repeat region (homopolymer extensions)  
+    if right_repeat_count > 0:
+        if adjustment_params.normalize_homopolymers:
+            # Homopolymer extensions: no edits, no scored positions
+            right_edits = 0
+            right_scored_positions = 0
+            right_score = scoring_format.homopolymer_extension * right_repeat_count
+        else:
+            # Treat as regular indel
+            if adjustment_params.normalize_indels:
+                right_edits = 1
+                right_scored_positions = 1
+                right_score = scoring_format.indel_start + (scoring_format.indel_extension * (right_repeat_count - 1))
+            else:
+                right_edits = right_repeat_count
+                right_scored_positions = right_repeat_count
+                right_score = scoring_format.indel_start * right_repeat_count
+        
+        total_edits += right_edits
+        total_scored_positions += right_scored_positions
+        score_parts.append(right_score)
+    
+    return {
+        'score_string': ''.join(score_parts),
+        'edits': total_edits,
+        'scored_positions': total_scored_positions,
+        'all_homopolymer': all_homopolymer
+    }
 
 
 def score_alignment(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_format=None):
@@ -446,39 +588,16 @@ def score_alignment(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_
 
             # We'll count scored positions after determining if it's a homopolymer
 
-            # Edit counting: check if homopolymer (if enabled)
-            is_homopolymer = adjustment_params.normalize_homopolymers and _is_homopolymer_extension(seq1_aligned, seq2_aligned,
-                                                                                                      indel_start, indel_end)
-
-            # Count scored positions based on adjustment settings
-            if is_homopolymer:
-                # Homopolymer indels: excluded from denominator when normalized
-                scored_positions += 0
-            elif adjustment_params.normalize_indels:
-                # Regular indels: count as single position when normalized
-                scored_positions += 1
-            else:
-                # No normalization: count each position separately
-                scored_positions += indel_length
-
-            # Edit scoring depends on adjustment settings
-            if is_homopolymer:
-                # Homopolymer extension - don't count in edits
-                # Add scoring codes for homopolymer extension
-                for pos in range(indel_start, indel_end + 1):
-                    score_aligned.append(scoring_format.homopolymer_extension)
-            elif adjustment_params.normalize_indels:
-                # Real indel with normalization - count as single edit
-                edits += 1
-                # First position scored as indel start, rest as extensions
-                for idx in range(indel_length):
-                    score_aligned.append(scoring_format.indel_start if idx == 0 else scoring_format.indel_extension)
-            else:
-                # No indel normalization - count each position as separate edit
-                edits += indel_length
-                # All positions scored as individual indel starts
-                for idx in range(indel_length):
-                    score_aligned.append(scoring_format.indel_start)
+            # Process indel using left-right homopolymer extension algorithm
+            indel_result = _process_indel_left_right(
+                seq1_aligned, seq2_aligned, indel_start, indel_end, 
+                adjustment_params, scoring_format, context_length=1
+            )
+            
+            # Add results from indel processing
+            edits += indel_result['edits']
+            scored_positions += indel_result['scored_positions']
+            score_aligned.append(indel_result['score_string'])
             
         else:
             # Substitution - count normally (scoring region already checked above)

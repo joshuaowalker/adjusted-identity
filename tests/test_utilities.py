@@ -14,8 +14,6 @@ from adjusted_identity import (
     _are_nucleotides_equivalent,
     _parse_suffix_gap_from_cigar,
     _find_scoring_region,
-    _is_homopolymer_extension,
-    _check_homopolymer_context,
 )
 
 
@@ -205,55 +203,6 @@ class TestScoringRegion:
         # Should account for gap positions
         assert start > 0
         assert end < len(seq1) - 1
-
-
-class TestHomopolymerDetection:
-    """Test homopolymer extension detection."""
-    
-    def test_simple_homopolymer_extension(self):
-        """Test detection of simple homopolymer extension."""
-        # AA-A vs AAAA (extra A extends A homopolymer)
-        seq1 = "AA-A"
-        seq2 = "AAAA"
-        assert _is_homopolymer_extension(seq1, seq2, 2, 2)  # Position 2 is the gap
-    
-    def test_not_homopolymer_extension(self):
-        """Test cases that are not homopolymer extensions."""
-        # AT-G vs ATCG (C is not extending a homopolymer)
-        seq1 = "AT-G"
-        seq2 = "ATCG"
-        assert not _is_homopolymer_extension(seq1, seq2, 2, 2)
-    
-    def test_multi_position_homopolymer(self):
-        """Test multi-position homopolymer extension."""
-        # AA--- vs AAAAA
-        seq1 = "AA---"
-        seq2 = "AAAAA"
-        assert _is_homopolymer_extension(seq1, seq2, 2, 4)  # Positions 2-4
-    
-    def test_homopolymer_context_checking(self):
-        """Test homopolymer context validation."""
-        # Context before indel
-        seq1 = "ATCAA-TG"
-        seq2 = "ATCAAATG"
-        assert _check_homopolymer_context(seq1, seq2, 5, 5, 'A')
-        
-        # No homopolymer context - different nucleotide insertion
-        seq1 = "ATCA-TG"
-        seq2 = "ATCAGTG"
-        assert not _check_homopolymer_context(seq1, seq2, 4, 4, 'G')
-    
-    def test_edge_cases_homopolymer(self):
-        """Test edge cases for homopolymer detection."""
-        # At sequence start
-        seq1 = "A-TCG"
-        seq2 = "AATCG"
-        assert _is_homopolymer_extension(seq1, seq2, 1, 1)
-        
-        # At sequence end
-        seq1 = "ATCG-"
-        seq2 = "ATCGG"
-        assert _is_homopolymer_extension(seq1, seq2, 4, 4)
 
 
 class TestIUPACCodes:

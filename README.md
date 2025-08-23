@@ -8,7 +8,7 @@ A Python package implementing MycoBLAST-style sequence identity calculations for
 
 - **Homopolymer Length Normalization**: Ignore differences in homopolymer run lengths (e.g., "AAA" vs "AAAA")
 - **IUPAC Ambiguity Code Handling**: Allow different ambiguity codes to match via nucleotide intersection
-- **End Trimming**: Skip mismatches in terminal regions to avoid sequencing artifacts
+- **End Trimming**: Skip mismatches in terminal regions to avoid sequencing artifacts (automatic for sequences >40bp)
 - **Indel Normalization**: Count contiguous indels as single evolutionary events
 - **Comprehensive Alignment**: Multi-stage bidirectional alignment optimization using edlib
 - **Flexible Configuration**: Enable/disable individual adjustments as needed
@@ -206,7 +206,7 @@ AdjustmentParams(
     normalize_homopolymers=True,    # Ignore homopolymer length differences
     handle_iupac_overlap=True,      # Allow IUPAC ambiguity intersections
     normalize_indels=True,          # Count contiguous indels as single events
-    end_skip_distance=20           # Distance from ends to skip mismatches
+    end_skip_distance=20           # Skip first/last N nucleotides (not positions) from scoring
 )
 ```
 
@@ -326,6 +326,59 @@ def process_alignment_file(alignment_file):
     
     return results
 ```
+
+## Understanding End Trimming Behavior
+
+The `end_skip_distance` parameter implements "digital end trimming" to skip sequencing artifacts near read ends. **Important**: This parameter counts **nucleotides** (non-gap characters), not alignment positions.
+
+### Automatic Activation
+
+End trimming only activates when sequences are long enough:
+
+```python
+from adjusted_identity import align_and_score, AdjustmentParams
+
+# Short sequences (< 2 × end_skip_distance nucleotides): NO trimming applied
+short_seq1 = "ATCGATCG"      # 8 nucleotides 
+short_seq2 = "ATCGATCG"      # 8 nucleotides
+result = align_and_score(short_seq1, short_seq2)  # Uses default end_skip_distance=20
+print(f"Scored positions: {result.scored_positions}")  # 8 (full sequence)
+print(f"Score pattern: {result.score_aligned}")        # "||||||||" (no trimming dots)
+
+# Long sequences (≥ 2 × end_skip_distance nucleotides): Trimming applied  
+long_seq1 = "A" * 25 + "TCGX" + "T" * 25    # 54 nucleotides
+long_seq2 = "A" * 25 + "TCGA" + "T" * 25    # 54 nucleotides
+result = align_and_score(long_seq1, long_seq2)
+print(f"Scored positions: {result.scored_positions}")  # ~14 (middle region only)
+print(f"Score pattern: {result.score_aligned}")        # ".......|||| |||||......." (dots show trimmed regions)
+```
+
+### Nucleotide vs Position Counting
+
+End trimming counts **actual nucleotides** in each sequence, ignoring gaps:
+
+```python
+# This alignment has gaps, but nucleotide counting still works correctly
+seq1_aligned = "AAA---TCGATCG---TTT"  # 12 nucleotides (ignoring gaps)
+seq2_aligned = "---AAATCGATCGTTT---"  # 12 nucleotides (ignoring gaps)
+
+# With end_skip_distance=5: skips first 5 and last 5 nucleotides from each sequence
+# Only the middle "TCGATCG" region (2 nucleotides) would be scored
+```
+
+### Customizing End Trimming
+
+```python
+# Disable end trimming completely
+no_trim_params = AdjustmentParams(end_skip_distance=0)
+result = align_and_score(long_seq1, long_seq2, no_trim_params)
+
+# Use shorter trimming distance for smaller sequences
+short_trim_params = AdjustmentParams(end_skip_distance=5) 
+result = align_and_score(medium_seq1, medium_seq2, short_trim_params)
+```
+
+**Rule of thumb**: For sequences shorter than `2 × end_skip_distance` nucleotides, end trimming has no effect and the entire alignment is scored.
 
 ## Advanced Usage
 

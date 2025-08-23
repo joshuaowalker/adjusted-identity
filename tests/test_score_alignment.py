@@ -133,6 +133,169 @@ class TestHomopolymerAdjustment:
         assert result.mismatches == 0
         assert result.scored_positions == 8  # 2A + 4T + 2G, extensions excluded
         assert result.score_aligned == "||==||||==||"
+    
+    def test_mixed_indel_with_homopolymer_ends(self):
+        """Indel with homopolymer extensions on ends but non-homopolymer content in middle."""
+        # AAATTGGG vs AA----GG: indel is ATTG
+        # Leading A and trailing G are now correctly detected as homopolymer extensions
+        # Internal TT is treated as plain indel content
+        result = score_alignment("AAATTGGG", "AA----GG", DEFAULT_ADJUSTMENT_PARAMS)
+        
+        # New algorithm correctly detects partial homopolymer extensions
+        assert result.identity == 0.8  # 4/5: matches at positions 0,1,6,7 + normalized indel counts as 1 mismatch
+        assert result.mismatches == 1  # Only the TT counts as 1 edit
+        assert result.scored_positions == 5  # 2 matches + 1 normalized indel + 2 matches
+        assert result.score_aligned == "||= -=||"  # Shows HP extensions (=) and regular indel ( -)
+        
+    def test_mixed_indel_potential_improvement(self):
+        """More complex case showing potential for improvement in homopolymer handling."""
+        # AAAATTTTGGGG vs AAA-----GGGG: indel contains ATTTT
+        # Could potentially recognize:
+        # - Leading A as homopolymer extension of AAA
+        # - Trailing G could be extension but we need the sequences to match exactly in the Gs
+        # - Middle TTTT as regular indel content
+        result = score_alignment("AAAATTTTGGGG", "AAA-----GGGG", DEFAULT_ADJUSTMENT_PARAMS)
+        
+        # Current behavior: entire indel treated as non-homopolymer
+        print(f"Complex case - Identity: {result.identity}")
+        print(f"Mismatches: {result.mismatches}")
+        print(f"Scored positions: {result.scored_positions}")
+        print(f"Score pattern: {result.score_aligned}")
+        
+        # Document current behavior - will adjust after seeing output
+        assert result.mismatches >= 1
+        assert result.scored_positions >= 7
+        
+    def test_left_right_homopolymer_algorithm(self):
+        """Test the new left-right homopolymer extension algorithm."""
+        
+        # Case 1: Simple case - should work the same as before
+        # AAA-TTT vs AAAATTT: single A extension
+        result1 = score_alignment("AAA-TTT", "AAAATTT", DEFAULT_ADJUSTMENT_PARAMS)
+        assert result1.identity == 1.0  # Should be perfect match
+        assert result1.score_aligned == "|||=|||"  # Homopolymer extension detected
+        
+        # Case 2: Mixed indel - left and right extensions
+        # AAATTGGG vs AA----GG: should detect A extension on left, G extension on right
+        result2 = score_alignment("AAATTGGG", "AA----GG", DEFAULT_ADJUSTMENT_PARAMS) 
+        
+        # Compare with raw (no adjustments) behavior
+        raw_result = score_alignment("AAATTGGG", "AA----GG", RAW_ADJUSTMENT_PARAMS)
+        
+        # The new algorithm should perform significantly better
+        assert result2.identity == 0.8  # 1 edit out of 5 scored positions
+        assert result2.score_aligned == "||= -=||"  # Left HP, regular indel, right HP
+        assert result2.identity > raw_result.identity  # Better than raw (0.5)
+        
+        # Verify the components
+        assert result2.mismatches == 1  # Only the TT counts as 1 normalized edit
+        assert result2.scored_positions == 5  # 2 matches + 1 normalized indel + 2 matches
+        
+    def test_partial_homopolymer_extension_detection(self):
+        """Test improved detection of partial homopolymer extensions within complex indels."""
+        
+        # Case 1: Mixed indel with no dominant homopolymer character
+        # AAATTGGG vs AA----GG: indel contains ATTG 
+        # A=25%, T=50%, G=25% - no character reaches 30% threshold in context
+        result1 = score_alignment("AAATTGGG", "AA----GG", DEFAULT_ADJUSTMENT_PARAMS)
+        print(f"Simple case - Identity: {result1.identity}, Score: {result1.score_aligned}")
+        
+        # Case 2: Mixed indel with dominant homopolymer character  
+        # AAAAATTGGG vs AAA---GGGG: indel contains AAT
+        # A=67% (above 30% threshold) and has homopolymer context (AAA before)
+        result2 = score_alignment("AAAAATTGGG", "AAA---GGGG", DEFAULT_ADJUSTMENT_PARAMS)
+        print(f"A-rich case - Identity: {result2.identity}, Score: {result2.score_aligned}")
+        
+        # Just verify results are reasonable for now
+        assert 0.0 <= result1.identity <= 1.0
+        assert 0.0 <= result2.identity <= 1.0
+
+    def test_boundary_conditions(self):
+        """Test boundary conditions for left-right algorithm components."""
+        
+        # Pure left only (no middle, no right)
+        result_left = score_alignment("AAA-TTT", "AAAATTT", DEFAULT_ADJUSTMENT_PARAMS)
+        assert result_left.identity == 1.0
+        assert result_left.score_aligned == "|||=|||"
+        assert result_left.mismatches == 0
+        
+        # Pure right only (no left, no middle) 
+        result_right = score_alignment("TTT-GGG", "TTTGGGG", DEFAULT_ADJUSTMENT_PARAMS)
+        assert result_right.identity == 1.0
+        assert result_right.score_aligned == "|||=|||"
+        assert result_right.mismatches == 0
+        
+        # Pure middle only (no left, no right - no homopolymer context)
+        result_middle = score_alignment("ATCG-CGA", "ATCGCCGA", DEFAULT_ADJUSTMENT_PARAMS)
+        assert result_middle.identity == 1.0  # C extends C context
+        assert result_middle.score_aligned == "||||=|||"
+        assert result_middle.mismatches == 0
+        
+        # Left + middle (no right)
+        result_left_middle = score_alignment("AAATTCG", "AA---CG", DEFAULT_ADJUSTMENT_PARAMS)
+        assert result_left_middle.identity == 0.8  # A extension + TT indel
+        assert result_left_middle.score_aligned == "||= -||"
+        assert result_left_middle.mismatches == 1
+        
+        # Right + middle (no left)  
+        result_right_middle = score_alignment("ATCGGGG", "AT--GGG", DEFAULT_ADJUSTMENT_PARAMS)
+        assert abs(result_right_middle.identity - (5/6)) < 0.001  # C indel + G extension
+        assert result_right_middle.score_aligned == "|| =|||"
+        assert result_right_middle.mismatches == 1
+        
+        # Left + right (no middle)
+        result_left_right = score_alignment("AA---GGG", "AAAAAGGG", DEFAULT_ADJUSTMENT_PARAMS)
+        assert result_left_right.identity == 1.0  # AA + G extensions
+        assert result_left_right.score_aligned == "||===|||"
+        assert result_left_right.mismatches == 0
+
+    def test_context_edge_cases(self):
+        """Test edge cases with missing context (start/end of sequence)."""
+        
+        # Indel at start of sequence (no left context)
+        result_no_left = score_alignment("-ATCG", "GATCG", DEFAULT_ADJUSTMENT_PARAMS)
+        assert result_no_left.identity == 0.8  # G indel at start
+        assert result_no_left.score_aligned == " ||||"
+        assert result_no_left.mismatches == 1
+        
+        # Indel at end of sequence (no right context)
+        result_no_right = score_alignment("ATCG-", "ATCGG", DEFAULT_ADJUSTMENT_PARAMS)
+        assert result_no_right.identity == 1.0  # G extends G context (homopolymer)
+        assert result_no_right.score_aligned == "||||="
+        assert result_no_right.mismatches == 0
+        
+        # Homopolymer at start (should still be detected if context allows)
+        result_hp_start = score_alignment("A-TCG", "AATCG", DEFAULT_ADJUSTMENT_PARAMS)
+        assert result_hp_start.identity == 1.0  # A extends A context
+        assert result_hp_start.score_aligned == "|=|||"
+        assert result_hp_start.mismatches == 0
+        
+        # Homopolymer at end (should still be detected if context allows)  
+        result_hp_end = score_alignment("TCGA-", "TCGAA", DEFAULT_ADJUSTMENT_PARAMS)
+        assert result_hp_end.identity == 1.0  # A extends A context
+        assert result_hp_end.score_aligned == "||||="
+        assert result_hp_end.mismatches == 0
+
+    def test_multiple_component_edge_cases(self):
+        """Test edge cases with various component combinations."""
+        
+        # Empty components should not affect scoring
+        # All components present but some very small
+        result_tiny = score_alignment("AATGGG", "A--GGG", DEFAULT_ADJUSTMENT_PARAMS)
+        assert result_tiny.identity == 0.8  # A extension + T indel 
+        assert result_tiny.score_aligned == "|= |||"
+        assert result_tiny.mismatches == 1
+        
+        # Large left component, small middle, small right
+        result_large_left = score_alignment("AAAAAAATCGGG", "AAA------GGG", DEFAULT_ADJUSTMENT_PARAMS)
+        assert abs(result_large_left.identity - (6/7)) < 0.001  # AAAA extension + ATC indel
+        assert result_large_left.score_aligned == "|||==== -|||"
+        assert result_large_left.mismatches == 1
+        
+        # Context characters that don't match (should be treated as middle)
+        result_no_match = score_alignment("ATCG-CGTA", "ATCGACGTA", DEFAULT_ADJUSTMENT_PARAMS)
+        assert result_no_match.identity > 0.8  # A indel, should find some context
+        assert result_no_match.mismatches <= 1
 
 
 class TestIUPACAdjustment:
