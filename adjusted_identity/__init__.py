@@ -768,38 +768,10 @@ def align_edlib_bidirectional(seq1, seq2):
     if result['editDistance'] == -1:
         return None  # Sentinel value for failed alignment
 
-    # Step 7: Parse CIGAR for suffix gaps in forward orientation
-    cigar_string = result.get('cigar')
-    suffix_gap_length = 0
-    if cigar_string:
-        gap_info = _parse_suffix_gap_from_cigar(cigar_string)
-
-        if gap_info:
-            gap_length, gap_in_query = gap_info
-            suffix_gap_length = gap_length
-
-            # Track suffix trimming
-            if gap_in_query:
-                seq2_suffix_trimmed = gap_length
-            else:
-                seq1_suffix_trimmed = gap_length
-
-            # Trim the sequences for returning
-            if gap_in_query:
-                current_seq2 = current_seq2[:-gap_length] if gap_length > 0 else current_seq2
-            else:
-                current_seq1 = current_seq1[:-gap_length] if gap_length > 0 else current_seq1
-
-    # Step 8: Get nice alignment and trim suffix if needed
+    # Step 8: Get nice alignment 
     alignment = edlib.getNiceAlignment(result, current_seq1, current_seq2)
     seq1_aligned = alignment['query_aligned']
     seq2_aligned = alignment['target_aligned']
-
-    if suffix_gap_length > 0:
-        # Trim the suffix from alignment strings
-        trim_pos = len(seq1_aligned) - suffix_gap_length
-        seq1_aligned = seq1_aligned[:trim_pos]
-        seq2_aligned = seq2_aligned[:trim_pos]
 
     # Step 9: Re-attach removed prefix and suffix regions with gap padding
     # Only one sequence can have prefix trimmed, only one can have suffix trimmed
@@ -815,20 +787,9 @@ def align_edlib_bidirectional(seq1, seq2):
         seq1_prefix_part = ""
         seq2_prefix_part = ""
 
-    # Handle suffix: one sequence has actual suffix, other gets gap padding
-    if seq1_suffix_trimmed > 0:
-        seq1_suffix_part = seq1[-seq1_suffix_trimmed:]
-        seq2_suffix_part = '-' * seq1_suffix_trimmed
-    elif seq2_suffix_trimmed > 0:
-        seq1_suffix_part = '-' * seq2_suffix_trimmed
-        seq2_suffix_part = seq2[-seq2_suffix_trimmed:]
-    else:
-        seq1_suffix_part = ""
-        seq2_suffix_part = ""
-
     # Re-attach prefix and suffix to alignment
-    seq1_aligned = seq1_prefix_part + seq1_aligned + seq1_suffix_part
-    seq2_aligned = seq2_prefix_part + seq2_aligned + seq2_suffix_part
+    seq1_aligned = seq1_prefix_part + seq1_aligned
+    seq2_aligned = seq2_prefix_part + seq2_aligned
 
     # Return final alignment with re-attached sequences
     final_alignment = {

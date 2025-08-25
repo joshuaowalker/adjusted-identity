@@ -513,6 +513,12 @@ BSD 2-Clause License - see [LICENSE](LICENSE) file for details.
 
 ## Changelog
 
+### Version 0.1.3
+- **Bug fix**: Fixed alignment length mismatch error in `align_edlib_bidirectional()`
+- Resolved "Aligned sequences must have same length" errors for certain sequence pairs
+- Simplified suffix trimming logic by removing unnecessary sequence trimming/reattachment
+- No API changes or performance impact
+
 ### Version 0.1.2
 - **Breaking**: Removed BioPython dependency - now only requires `edlib`
 - Implemented custom `reverse_complement()` function with full IUPAC support
