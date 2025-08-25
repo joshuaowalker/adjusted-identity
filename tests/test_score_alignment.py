@@ -10,6 +10,7 @@ expected behavior for specific sequence patterns and parameter combinations.
 import pytest
 from adjusted_identity import (
     score_alignment,
+    align_and_score,
     AdjustmentParams,
     ScoringFormat,
     DEFAULT_ADJUSTMENT_PARAMS,
@@ -680,3 +681,105 @@ class TestDocumentationExamples:
         no_trim = AdjustmentParams(end_skip_distance=0)
         result_no_trim = score_alignment(seq1, seq2, no_trim)
         assert result_no_trim.identity < result.identity
+
+
+class TestOverhangScoring:
+    """Test cases for proper handling of overhang regions when end_skip_distance=0."""
+    
+    def test_left_overhang_not_scored(self):
+        """When end_skip_distance=0, left overhang should not be scored."""
+        # Sequence 1 has extra bases at start
+        seq1 = "AAATTTGGG"
+        seq2 = "TTTGGG"
+        
+        # This should align as: AAATTTGGG
+        #                       ---TTTGGG
+        # With end_skip_distance=0, we should only score TTTGGG vs TTTGGG (identity=1.0)
+        # Currently, this incorrectly scores the AAA overhang region too
+        
+        no_trim = AdjustmentParams(end_skip_distance=0)
+        result = align_and_score(seq1, seq2, no_trim)
+        
+        # Should be 1.0 since overlapping region matches perfectly
+        assert result.identity == 1.0, f"Expected 1.0, got {result.identity}"
+        
+    def test_right_overhang_not_scored(self):
+        """When end_skip_distance=0, right overhang should not be scored."""
+        # Sequence 1 has extra bases at end
+        seq1 = "TTTGGGAAA"
+        seq2 = "TTTGGG"
+        
+        # This should align as: TTTGGGAAA
+        #                       TTTGGG---
+        # With end_skip_distance=0, we should only score TTTGGG vs TTTGGG (identity=1.0)
+        
+        no_trim = AdjustmentParams(end_skip_distance=0)
+        result = align_and_score(seq1, seq2, no_trim)
+        
+        # Should be 1.0 since overlapping region matches perfectly
+        assert result.identity == 1.0, f"Expected 1.0, got {result.identity}"
+        
+    def test_both_overhangs_not_scored(self):
+        """When end_skip_distance=0, neither overhang should be scored."""
+        # Both sequences have overhangs
+        seq1 = "AAATTTGGGCCC"
+        seq2 = "XXXTTTGGGYYY"
+        
+        # This should align as: AAATTTGGGCCC
+        #                       XXXTTTGGGYYY
+        # With end_skip_distance=0, we should only score TTTGGG vs TTTGGG (identity=1.0)
+        # The AAA/XXX and CCC/YYY overhangs should not be scored
+        
+        no_trim = AdjustmentParams(end_skip_distance=0)
+        result = align_and_score(seq1, seq2, no_trim)
+        
+        # Should be 1.0 since overlapping region matches perfectly
+        assert result.identity == 1.0, f"Expected 1.0, got {result.identity}"
+        
+    def test_no_overlap_case(self):
+        """Edge case: sequences with no overlapping content should have identity=0."""
+        # Use score_alignment directly with pre-aligned sequences
+        seq1_aligned = "AAAA----"
+        seq2_aligned = "----TTTT"
+        
+        no_trim = AdjustmentParams(end_skip_distance=0)
+        result = score_alignment(seq1_aligned, seq2_aligned, no_trim)
+        
+        # No overlapping content - should be identity 0
+        assert result.identity == 0.0, f"Expected 0.0, got {result.identity}"
+        
+    def test_single_position_overlap(self):
+        """Edge case: single position of overlap."""
+        # Use score_alignment directly with pre-aligned sequences
+        seq1_aligned = "AAA-"
+        seq2_aligned = "-AAG"
+        
+        no_trim = AdjustmentParams(end_skip_distance=0)
+        result = score_alignment(seq1_aligned, seq2_aligned, no_trim)
+        
+        # Single overlapping position: A vs A = match, so identity should be 1.0
+        assert result.identity == 1.0, f"Expected 1.0, got {result.identity}"
+        
+    def test_single_position_mismatch(self):
+        """Edge case: two positions of overlap with one mismatch."""
+        # Use score_alignment directly with pre-aligned sequences
+        seq1_aligned = "AAA-"
+        seq2_aligned = "-ATG"
+        
+        no_trim = AdjustmentParams(end_skip_distance=0)
+        result = score_alignment(seq1_aligned, seq2_aligned, no_trim)
+        
+        # Two overlapping positions: A vs A (match), A vs T (mismatch) = 50% identity
+        assert result.identity == 0.5, f"Expected 0.5, got {result.identity}"
+        
+    def test_true_single_position_mismatch(self):
+        """Edge case: single position of overlap with mismatch."""
+        # Use score_alignment directly with pre-aligned sequences
+        seq1_aligned = "AA-"
+        seq2_aligned = "-AT"
+        
+        no_trim = AdjustmentParams(end_skip_distance=0)
+        result = score_alignment(seq1_aligned, seq2_aligned, no_trim)
+        
+        # Single overlapping position: A vs A = match, so identity should be 1.0
+        assert result.identity == 1.0, f"Expected 1.0, got {result.identity}"

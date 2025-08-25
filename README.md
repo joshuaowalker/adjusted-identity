@@ -513,6 +513,12 @@ BSD 2-Clause License - see [LICENSE](LICENSE) file for details.
 
 ## Changelog
 
+### Version 0.1.4
+- **Bug fix**: Fixed overhang scoring behavior when `end_skip_distance=0`
+- Now correctly scores only positions where both sequences have content (no gap vs nucleotide scoring)
+- Added comprehensive test suite for overhang region handling edge cases
+- No API changes - existing code will work unchanged but may see different results for overhang alignments
+
 ### Version 0.1.3
 - **Bug fix**: Fixed alignment length mismatch error in `align_edlib_bidirectional()`
 - Resolved "Aligned sequences must have same length" errors for certain sequence pairs

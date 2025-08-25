@@ -254,11 +254,15 @@ def _find_scoring_region(seq1_aligned, seq2_aligned, end_skip_distance):
     nucleotides (not alignment positions) from each sequence to avoid counting sequencing 
     artifacts near read ends.
     
+    Special case: When end_skip_distance=0, only score positions where both sequences 
+    have non-gap characters (no overhang scoring).
+    
     IMPORTANT: This function counts NUCLEOTIDES (non-gap characters), not alignment positions.
     End trimming only activates when both sequences have >= end_skip_distance nucleotides
     available to skip from each end.
     
     Behavior:
+    - end_skip_distance=0: Score only overlap region (both sequences have content)
     - Short sequences (< 2×end_skip_distance nucleotides): Returns full range [0, len-1]
     - Long sequences (≥ 2×end_skip_distance nucleotides): Returns trimmed range excluding ends
     - Gap characters ('-') are ignored when counting nucleotides
@@ -280,6 +284,25 @@ def _find_scoring_region(seq1_aligned, seq2_aligned, end_skip_distance):
     """
     alignment_length = len(seq1_aligned)
     
+    # Special case: end_skip_distance=0 means score only overlap region
+    if end_skip_distance == 0:
+        # Find first position where both sequences have content
+        scoring_start = 0
+        for pos in range(alignment_length):
+            if seq1_aligned[pos] != '-' and seq2_aligned[pos] != '-':
+                scoring_start = pos
+                break
+        
+        # Find last position where both sequences have content
+        scoring_end = alignment_length - 1
+        for pos in range(alignment_length - 1, -1, -1):
+            if seq1_aligned[pos] != '-' and seq2_aligned[pos] != '-':
+                scoring_end = pos
+                break
+        
+        return scoring_start, scoring_end
+    
+    # General case: skip end_skip_distance nucleotides from each end
     # Find scoring start: first position where both sequences have >= end_skip_distance bp
     seq1_count = seq2_count = 0
     scoring_start = 0
