@@ -68,6 +68,7 @@ print(f"Adjusted identity: {adj_result.identity:.3f}")
 
 # Examine the scoring pattern
 print(f"Score pattern: {adj_result.score_aligned}")
+# '|' = exact match, '=' = ambiguous/homopolymer, ' ' = substitution
 ```
 
 ## Use Cases
@@ -98,6 +99,30 @@ barcode2 = "ATCGKGTC"  # K = G or T (both R and K contain G)
 
 result = align_and_score(barcode1, barcode2)
 print(f"Identity with IUPAC handling: {result.identity:.3f}")  # Should be 1.0
+print(f"Score pattern: {result.score_aligned}")  # Shows '=' for ambiguous matches
+```
+
+### Understanding Score Patterns
+
+The `score_aligned` field provides a visual representation of how each position was scored:
+
+- `|` = Exact match between standard nucleotides (A=A, C=C, G=G, T=T)
+- `=` = Ambiguous match (IUPAC codes) or homopolymer extension
+- ` ` (space) = Substitution (mismatch)
+- `-` = Indel extension (normalized)
+- `.` = End-trimmed position (not scored)
+
+```python
+from adjusted_identity import align_and_score
+
+result = align_and_score("ATCGRAAATGTC", "ATCGAAAAATGTC")
+print(f"Seq1: {result.seq1_aligned}")
+print(f"Seq2: {result.seq2_aligned}") 
+print(f"Score: {result.score_aligned}")
+# Output might show: ||||==||||||
+#                    ATCG = exact matches (||||)
+#                    R vs A = ambiguous match (=)
+#                    AAA vs AAAA = homopolymer extension (=)
 ```
 
 ### Repeat Motif Handling
@@ -237,7 +262,8 @@ Customize alignment visualization characters:
 
 ```python
 ScoringFormat(
-    match='|',                     # Exact match or IUPAC equivalent
+    match='|',                     # Exact match (A=A, C=C, G=G, T=T)
+    ambiguous_match='=',           # Ambiguous nucleotide match (any IUPAC code match)
     substitution=' ',              # Nucleotide substitution
     indel_start=' ',               # First position of indel
     indel_extension='-',           # Indel positions (normalization)
@@ -512,6 +538,12 @@ Mycota Lab. https://mycotalab.substack.com/p/why-ncbi-blast-identity-scores-can
 BSD 2-Clause License - see [LICENSE](LICENSE) file for details.
 
 ## Changelog
+
+### Version 0.1.5
+- **Enhancement**: Added `ambiguous_match` field to `ScoringFormat` to distinguish between exact nucleotide matches and ambiguous matches
+- Modified `_are_nucleotides_equivalent()` to return a tuple indicating match type  
+- Score patterns now show `|` for exact standard nucleotide matches (A=A, C=C, G=G, T=T) and `=` for any matches involving IUPAC ambiguity codes
+- No breaking changes - existing code works unchanged but score visualization is more informative
 
 ### Version 0.1.4
 - **Bug fix**: Fixed overhang scoring behavior when `end_skip_distance=0`

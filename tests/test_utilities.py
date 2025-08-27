@@ -89,53 +89,56 @@ class TestNucleotideEquivalence:
     
     def test_exact_matches(self):
         """Test exact nucleotide matches."""
-        assert _are_nucleotides_equivalent('A', 'A')
-        assert _are_nucleotides_equivalent('T', 'T')
-        assert _are_nucleotides_equivalent('C', 'C')
-        assert _are_nucleotides_equivalent('G', 'G')
-        assert _are_nucleotides_equivalent('N', 'N')
+        # Standard nucleotides should match exactly and not be ambiguous
+        assert _are_nucleotides_equivalent('A', 'A') == (True, False)
+        assert _are_nucleotides_equivalent('T', 'T') == (True, False)
+        assert _are_nucleotides_equivalent('C', 'C') == (True, False)
+        assert _are_nucleotides_equivalent('G', 'G') == (True, False)
+        # N=N is ambiguous since N is an ambiguity code
+        assert _are_nucleotides_equivalent('N', 'N') == (True, True)
     
     def test_case_insensitive(self):
         """Test case insensitive matching."""
-        assert _are_nucleotides_equivalent('a', 'A')
-        assert _are_nucleotides_equivalent('A', 'a')
-        assert _are_nucleotides_equivalent('r', 'R')
+        assert _are_nucleotides_equivalent('a', 'A') == (True, False)
+        assert _are_nucleotides_equivalent('A', 'a') == (True, False)
+        assert _are_nucleotides_equivalent('r', 'R') == (True, True)  # R=R is ambiguous
     
     def test_iupac_intersections_enabled(self):
         """Test IUPAC code intersections when enabled."""
-        # R (AG) and K (GT) both contain G
-        assert _are_nucleotides_equivalent('R', 'K', enable_iupac_intersection=True)
+        # R (AG) and K (GT) both contain G - ambiguous match
+        assert _are_nucleotides_equivalent('R', 'K', enable_iupac_intersection=True) == (True, True)
         
-        # R (AG) contains A
-        assert _are_nucleotides_equivalent('R', 'A', enable_iupac_intersection=True)
+        # R (AG) contains A - ambiguous match
+        assert _are_nucleotides_equivalent('R', 'A', enable_iupac_intersection=True) == (True, True)
         
-        # Y (CT) and S (GC) both contain C
-        assert _are_nucleotides_equivalent('Y', 'S', enable_iupac_intersection=True)
+        # Y (CT) and S (GC) both contain C - ambiguous match
+        assert _are_nucleotides_equivalent('Y', 'S', enable_iupac_intersection=True) == (True, True)
         
         # R (AG) and Y (CT) have no overlap
-        assert not _are_nucleotides_equivalent('R', 'Y', enable_iupac_intersection=True)
+        assert _are_nucleotides_equivalent('R', 'Y', enable_iupac_intersection=True) == (False, False)
     
     def test_iupac_intersections_disabled(self):
         """Test IUPAC code handling when intersections disabled."""
         # Different ambiguity codes should not match
-        assert not _are_nucleotides_equivalent('R', 'K', enable_iupac_intersection=False)
+        assert _are_nucleotides_equivalent('R', 'K', enable_iupac_intersection=False) == (False, False)
         
-        # But standard nucleotide vs ambiguity should still work
-        assert _are_nucleotides_equivalent('R', 'A', enable_iupac_intersection=False)
-        assert _are_nucleotides_equivalent('A', 'R', enable_iupac_intersection=False)
+        # But standard nucleotide vs ambiguity should still work - ambiguous match
+        assert _are_nucleotides_equivalent('R', 'A', enable_iupac_intersection=False) == (True, True)
+        assert _are_nucleotides_equivalent('A', 'R', enable_iupac_intersection=False) == (True, True)
     
     def test_gap_handling(self):
         """Test gap character handling."""
-        assert _are_nucleotides_equivalent('-', '-')
-        assert not _are_nucleotides_equivalent('-', 'A')
-        assert not _are_nucleotides_equivalent('A', '-')
+        # Gap matching gap is not ambiguous (it's a special case)
+        assert _are_nucleotides_equivalent('-', '-') == (True, True)  # Gap is not a standard nucleotide
+        assert _are_nucleotides_equivalent('-', 'A') == (False, False)
+        assert _are_nucleotides_equivalent('A', '-') == (False, False)
     
     def test_unknown_codes(self):
         """Test handling of unknown nucleotide codes."""
-        # Unknown codes should only match themselves exactly
-        assert _are_nucleotides_equivalent('X', 'X')
-        assert not _are_nucleotides_equivalent('X', 'A')
-        assert not _are_nucleotides_equivalent('A', 'X')
+        # Unknown codes should only match themselves exactly - ambiguous since not standard
+        assert _are_nucleotides_equivalent('X', 'X') == (True, True)
+        assert _are_nucleotides_equivalent('X', 'A') == (False, False)
+        assert _are_nucleotides_equivalent('A', 'X') == (False, False)
 
 
 class TestCigarParsing:

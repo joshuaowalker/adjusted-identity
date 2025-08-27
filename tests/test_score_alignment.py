@@ -299,6 +299,51 @@ class TestHomopolymerAdjustment:
         assert result_no_match.mismatches <= 1
 
 
+class TestAmbiguousMatching:
+    """Test the new ambiguous matching scoring code feature."""
+    
+    def test_standard_nucleotide_matches(self):
+        """Standard nucleotides (ATCG) should use '|' when matching exactly."""
+        result = score_alignment("ATCG", "ATCG", DEFAULT_ADJUSTMENT_PARAMS)
+        assert result.score_aligned == "||||"
+        assert '=' not in result.score_aligned  # No ambiguous matches
+    
+    def test_ambiguous_code_self_match(self):
+        """Ambiguity codes matching themselves should use '='."""
+        # N, R, Y are ambiguity codes
+        result = score_alignment("NRY", "NRY", DEFAULT_ADJUSTMENT_PARAMS)
+        assert result.score_aligned == "==="
+        assert result.identity == 1.0
+    
+    def test_mixed_standard_and_ambiguous(self):
+        """Mixed standard and ambiguous nucleotides should use appropriate codes."""
+        # A and T are standard, N is ambiguous
+        result = score_alignment("ATN", "ATN", DEFAULT_ADJUSTMENT_PARAMS)
+        assert result.score_aligned == "||="
+    
+    def test_ambiguous_intersection_match(self):
+        """Different ambiguity codes that intersect should use '='."""
+        # R (AG) and D (AGT) intersect at A and G
+        result = score_alignment("R", "D", DEFAULT_ADJUSTMENT_PARAMS)
+        assert result.score_aligned == "="
+        assert result.identity == 1.0
+    
+    def test_standard_vs_ambiguous_match(self):
+        """Standard nucleotide matching ambiguity code should use '='."""
+        # A matches R (AG)
+        result = score_alignment("A", "R", DEFAULT_ADJUSTMENT_PARAMS)
+        assert result.score_aligned == "="
+        assert result.identity == 1.0
+    
+    def test_custom_scoring_format(self):
+        """Test using custom ScoringFormat with different ambiguous_match code."""
+        custom_format = ScoringFormat(ambiguous_match='*')
+        # R (AG) matches A
+        result = score_alignment("ATRG", "ATAG", DEFAULT_ADJUSTMENT_PARAMS, custom_format)
+        assert result.score_aligned == "||*|"
+        assert result.identity == 1.0
+
+
 class TestIUPACAdjustment:
     """Test IUPAC ambiguity code handling."""
     
@@ -308,7 +353,8 @@ class TestIUPACAdjustment:
         assert result.identity == 1.0
         assert result.mismatches == 0
         assert result.scored_positions == 4
-        assert result.score_aligned == "||||"
+        # A=A is exact (|), N=N, R=R, G=G are all ambiguous (=)
+        assert result.score_aligned == "|==|"
     
     def test_iupac_intersection_match(self):
         """Different IUPAC codes with overlapping nucleotides should match."""
@@ -317,7 +363,8 @@ class TestIUPACAdjustment:
         assert result.identity == 1.0
         assert result.mismatches == 0
         assert result.scored_positions == 4
-        assert result.score_aligned == "||||"
+        # A=A, T=T are exact (|), R=K is ambiguous (=), G=G is exact (|)
+        assert result.score_aligned == "||=|"
     
     def test_iupac_intersection_disabled(self):
         """IUPAC intersection disabled should not match different ambiguity codes."""
@@ -344,7 +391,8 @@ class TestIUPACAdjustment:
         assert result.identity == 1.0
         assert result.mismatches == 0
         assert result.scored_positions == 4
-        assert result.score_aligned == "||||"
+        # A=A, T=T are exact (|), R=A is ambiguous (=), G=G is exact (|)
+        assert result.score_aligned == "||=|"
 
 
 class TestEndTrimming:
@@ -390,7 +438,8 @@ class TestCombinedAdjustments:
         assert result.identity == 1.0  # All differences adjusted away
         assert result.mismatches == 0
         assert result.scored_positions == 7
-        assert result.score_aligned == "|||=||||"
+        # AAA match (|||), homopolymer indel (=), TT match (||), R/K ambiguous (=), G match (|)
+        assert result.score_aligned == "|||=||=|"
     
     def test_all_adjustments_disabled(self):
         """Same case with all adjustments disabled."""

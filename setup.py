@@ -16,7 +16,7 @@ def read_readme():
 
 setup(
     name="adjusted-identity",
-    version="0.1.4",
+    version="0.1.5",
     author="Josh Walker",
     author_email="joshowalker@yahoo.com",
     description="Adjusted Identity Calculator for DNA Sequences with MycoBLAST-style preprocessing",

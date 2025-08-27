@@ -100,7 +100,8 @@ class AlignmentResult:
 @dataclass(frozen=True)
 class ScoringFormat:
     """Format codes for alignment scoring visualization."""
-    match: str = '|'                    # Exact match or IUPAC equivalent
+    match: str = '|'                    # Exact match (A=A, C=C, G=G, T=T)
+    ambiguous_match: str = '='          # Ambiguous nucleotide match (any IUPAC code match)
     substitution: str = ' '             # Nucleotide substitution
     indel_start: str = ' '              # First position of indel (scored)
     indel_extension: str = '-'          # Indel positions skipped due to normalization
@@ -181,11 +182,19 @@ def _are_nucleotides_equivalent(nuc1, nuc2, enable_iupac_intersection=True):
         enable_iupac_intersection (bool): Allow different ambiguity codes to match via intersection
         
     Returns:
-        bool: True if nucleotides are equivalent (including ambiguous matches)
+        tuple: (is_match, is_ambiguous) where:
+            - is_match: True if nucleotides are equivalent
+            - is_ambiguous: True if match involves ambiguity codes (not exact A=A, C=C, G=G, T=T)
     """
     # Convert to uppercase
     nuc1 = nuc1.upper()
     nuc2 = nuc2.upper()
+    
+    # Check for exact match first (including gap characters)
+    if nuc1 == nuc2:
+        # Exact match - check if it's one of the standard nucleotides
+        is_standard = nuc1 in {'A', 'T', 'C', 'G'}
+        return (True, not is_standard)
     
     # Get possible nucleotides for each code
     possible1 = IUPAC_CODES.get(nuc1, {nuc1})
@@ -196,9 +205,13 @@ def _are_nucleotides_equivalent(nuc1, nuc2, enable_iupac_intersection=True):
     both_codes_sets = len(possible1) > 1 and len(possible2) > 1
 
     if enable_iupac_intersection:
-        return has_overlap
+        # Any overlap counts as a match, and it's ambiguous since nuc1 != nuc2
+        return (has_overlap, has_overlap)
     else:
-        return has_overlap and not both_codes_sets
+        # When disabled, only allow exact code match or standard nucleotide vs ambiguity code
+        is_match = has_overlap and not both_codes_sets
+        # It's ambiguous if there's a match but not exact (nuc1 != nuc2)
+        return (is_match, is_match)
 
 
 
@@ -651,12 +664,16 @@ def score_alignment(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_
         # We're in the scoring region
 
         # Check for exact match or IUPAC equivalence
-        is_equivalent = _are_nucleotides_equivalent(seq1_char, seq2_char, adjustment_params.handle_iupac_overlap)
+        is_equivalent, is_ambiguous = _are_nucleotides_equivalent(seq1_char, seq2_char, adjustment_params.handle_iupac_overlap)
 
         if is_equivalent:
             # Match - no edit
             scored_positions += 1
-            score_aligned.append(scoring_format.match)
+            # Use appropriate scoring code based on match type
+            if is_ambiguous:
+                score_aligned.append(scoring_format.ambiguous_match)
+            else:
+                score_aligned.append(scoring_format.match)
             i += 1
         elif seq1_char == '-' or seq2_char == '-':
             # Start of an indel region - find end of contiguous gaps in the same sequence
