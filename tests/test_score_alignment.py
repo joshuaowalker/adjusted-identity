@@ -668,6 +668,21 @@ class TestEdgeCases:
         with pytest.raises(ValueError, match="same length"):
             score_alignment("ATCG", "ATCGX", DEFAULT_ADJUSTMENT_PARAMS)
 
+    def test_invalid_adjustment_params(self):
+        """Invalid AdjustmentParams configuration should raise error."""
+        # normalize_homopolymers=True requires max_repeat_motif_length >= 1
+        with pytest.raises(ValueError, match="Contradictory configuration"):
+            AdjustmentParams(normalize_homopolymers=True, max_repeat_motif_length=0)
+
+        # Negative max_repeat_motif_length should also fail
+        with pytest.raises(ValueError, match="Contradictory configuration"):
+            AdjustmentParams(normalize_homopolymers=True, max_repeat_motif_length=-1)
+
+        # But normalize_homopolymers=False with max_repeat_motif_length=0 should be OK
+        params = AdjustmentParams(normalize_homopolymers=False, max_repeat_motif_length=0)
+        assert params.normalize_homopolymers is False
+        assert params.max_repeat_motif_length == 0
+
 
 class TestScoringFormatCustomization:
     """Test custom scoring format codes."""

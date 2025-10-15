@@ -539,6 +539,12 @@ BSD 2-Clause License - see [LICENSE](LICENSE) file for details.
 
 ## Changelog
 
+### Version 0.1.6
+- **Enhancement**: Added validation for contradictory `AdjustmentParams` configuration
+- Now raises `ValueError` when `normalize_homopolymers=True` but `max_repeat_motif_length < 1` (which would silently disable homopolymer normalization)
+- Added comprehensive test coverage for parameter validation edge cases
+- No API changes - existing valid configurations work unchanged
+
 ### Version 0.1.5
 - **Enhancement**: Added `ambiguous_match` field to `ScoringFormat` to distinguish between exact nucleotide matches and ambiguous matches
 - Modified `_are_nucleotides_equivalent()` to return a tuple indicating match type  

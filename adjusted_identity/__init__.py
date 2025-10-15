@@ -136,6 +136,14 @@ class AdjustmentParams:
     end_skip_distance: int = 20              # Nucleotides to skip from each end (0 to disable)
     max_repeat_motif_length: int = 2         # Maximum repeat motif length to detect (default: dinucleotides)
 
+    def __post_init__(self):
+        """Validate parameter combinations."""
+        if self.normalize_homopolymers and self.max_repeat_motif_length < 1:
+            raise ValueError(
+                f"Contradictory configuration: normalize_homopolymers=True requires "
+                f"max_repeat_motif_length >= 1 to detect homopolymers, got {self.max_repeat_motif_length}"
+            )
+
 
 # Default adjustment parameters (all adjustments enabled)
 DEFAULT_ADJUSTMENT_PARAMS = AdjustmentParams()
