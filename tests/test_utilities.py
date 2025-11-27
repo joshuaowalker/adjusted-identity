@@ -128,8 +128,8 @@ class TestNucleotideEquivalence:
     
     def test_gap_handling(self):
         """Test gap character handling."""
-        # Gap matching gap is not ambiguous (it's a special case)
-        assert _are_nucleotides_equivalent('-', '-') == (True, True)  # Gap is not a standard nucleotide
+        # Gap matching gap is treated as a non-ambiguous match (MSA support)
+        assert _are_nucleotides_equivalent('-', '-') == (True, False)  # Dual-gaps use '|' marker
         assert _are_nucleotides_equivalent('-', 'A') == (False, False)
         assert _are_nucleotides_equivalent('A', '-') == (False, False)
     

@@ -145,6 +145,25 @@ class AdjustmentParams:
             )
 
 
+@dataclass(frozen=True)
+class AlleleAnalysis:
+    """Analysis of an allele's composition within a variant range.
+
+    Used by the variant range algorithm to track how much of an allele
+    can be explained as repeat extensions of surrounding context.
+
+    Attributes:
+        left_extension_count: Number of characters consumed as left repeat extension
+        right_extension_count: Number of characters consumed as right repeat extension
+        core_content: Remaining characters not explained by repeat extensions
+        is_pure_extension: True if entire allele is repeat extensions (core is empty)
+    """
+    left_extension_count: int
+    right_extension_count: int
+    core_content: str
+    is_pure_extension: bool
+
+
 # Default adjustment parameters (all adjustments enabled)
 DEFAULT_ADJUSTMENT_PARAMS = AdjustmentParams()
 
@@ -200,9 +219,10 @@ def _are_nucleotides_equivalent(nuc1, nuc2, enable_iupac_intersection=True):
     
     # Check for exact match first (including gap characters)
     if nuc1 == nuc2:
-        # Exact match - check if it's one of the standard nucleotides
-        is_standard = nuc1 in {'A', 'T', 'C', 'G'}
-        return (True, not is_standard)
+        # Exact match - check if it's one of the standard nucleotides or a gap
+        # Gaps matching are treated as non-ambiguous matches (MSA support)
+        is_standard_or_gap = nuc1 in {'A', 'T', 'C', 'G', '-'}
+        return (True, not is_standard_or_gap)
     
     # Get possible nucleotides for each code
     possible1 = IUPAC_CODES.get(nuc1, {nuc1})
@@ -351,6 +371,528 @@ def _find_scoring_region(seq1_aligned, seq2_aligned, end_skip_distance):
     return scoring_start, scoring_end
 
 
+def _extract_left_context(seq1_aligned, seq2_aligned, position, length):
+    """
+    Extract up to 'length' nucleotide characters from positions before 'position',
+    working backwards, enforcing consensus between sequences for MSA support.
+
+    Context extraction rules (MSA-compatible):
+    - Both sequences agree (same non-gap char) → use it (valid consensus)
+    - One has gap, other has char → use the character (unambiguous)
+    - Both have gaps (dual-gap) → skip position entirely
+    - Both have different non-gap chars → conflict, return None (no consensus)
+
+    Args:
+        seq1_aligned, seq2_aligned: Aligned sequences with gaps
+        position: Starting position (exclusive, work backward from here)
+        length: Number of nucleotide characters to extract
+
+    Returns:
+        str: Context string in left-to-right order (e.g., "AAA"), or None if:
+            - Insufficient context available (fewer than 'length' chars)
+            - Sequences disagree at context position (conflicting characters)
+
+    Examples:
+        >>> _extract_left_context("AGG-AC", "AG-GAC", 2, 1)
+        'G'  # Both sequences agree at position 1
+        >>> _extract_left_context("AGT-AC", "AX-GAC", 2, 1)
+        None  # Sequences disagree at position 1 (G vs X)
+    """
+    context_chars = []
+    pos = position - 1
+
+    while len(context_chars) < length and pos >= 0:
+        char1 = seq1_aligned[pos]
+        char2 = seq2_aligned[pos]
+
+        # Skip dual-gap positions (common in MSA-derived alignments)
+        if char1 == '-' and char2 == '-':
+            pos -= 1
+            continue
+
+        # Both sequences have content - they must AGREE for valid consensus
+        if char1 != '-' and char2 != '-':
+            if char1.upper() == char2.upper():
+                context_chars.append(char1)
+            else:
+                # Disagreement = no clear consensus context
+                # Cannot reliably detect homopolymer extension
+                return None
+        else:
+            # One has gap, other has character - use the non-gap character
+            context_chars.append(char1 if char1 != '-' else char2)
+
+        pos -= 1
+
+    # Check if we collected enough context characters
+    if len(context_chars) < length:
+        return None  # Insufficient context available
+
+    # Reverse to get left-to-right order
+    return ''.join(reversed(context_chars))
+
+
+def _extract_right_context(seq1_aligned, seq2_aligned, position, length):
+    """
+    Extract up to 'length' nucleotide characters from positions after 'position',
+    working forwards, enforcing consensus between sequences for MSA support.
+
+    Context extraction rules (MSA-compatible):
+    - Both sequences agree (same non-gap char) → use it (valid consensus)
+    - One has gap, other has char → use the character (unambiguous)
+    - Both have gaps (dual-gap) → skip position entirely
+    - Both have different non-gap chars → conflict, return None (no consensus)
+
+    Args:
+        seq1_aligned, seq2_aligned: Aligned sequences with gaps
+        position: Starting position (exclusive, work forward from here)
+        length: Number of nucleotide characters to extract
+
+    Returns:
+        str: Context string in left-to-right order (e.g., "TTT"), or None if:
+            - Insufficient context available (fewer than 'length' chars)
+            - Sequences disagree at context position (conflicting characters)
+
+    Examples:
+        >>> _extract_right_context("AGA--TT", "AGAT-TT", 4, 2)
+        'TT'  # Both sequences agree at positions 5-6
+        >>> _extract_right_context("AGA--TC", "AGAT-TG", 4, 2)
+        None  # Sequences disagree at position 6 (C vs G)
+    """
+    context_chars = []
+    pos = position + 1
+    max_pos = len(seq1_aligned)
+
+    while len(context_chars) < length and pos < max_pos:
+        char1 = seq1_aligned[pos]
+        char2 = seq2_aligned[pos]
+
+        # Skip dual-gap positions (common in MSA-derived alignments)
+        if char1 == '-' and char2 == '-':
+            pos += 1
+            continue
+
+        # Both sequences have content - they must AGREE for valid consensus
+        if char1 != '-' and char2 != '-':
+            if char1.upper() == char2.upper():
+                context_chars.append(char1)
+            else:
+                # Disagreement = no clear consensus context
+                # Cannot reliably detect homopolymer extension
+                return None
+        else:
+            # One has gap, other has character - use the non-gap character
+            context_chars.append(char1 if char1 != '-' else char2)
+
+        pos += 1
+
+    # Check if we collected enough context characters
+    if len(context_chars) < length:
+        return None  # Insufficient context available
+
+    return ''.join(context_chars)
+
+
+# =============================================================================
+# Variant Range Algorithm Functions (v0.2.0)
+# =============================================================================
+
+def _extract_allele(seq_aligned, start, end):
+    """
+    Extract non-gap characters from aligned sequence within range [start, end].
+
+    Args:
+        seq_aligned: Aligned sequence with gaps
+        start: Start position (inclusive)
+        end: End position (inclusive)
+
+    Returns:
+        tuple: (allele_string, list_of_source_positions)
+    """
+    chars = []
+    positions = []
+    for i in range(start, end + 1):
+        if seq_aligned[i] != '-':
+            chars.append(seq_aligned[i])
+            positions.append(i)
+    return (''.join(chars), positions)
+
+
+def _motif_matches(chunk, motif, handle_iupac):
+    """
+    Check if chunk matches motif using IUPAC equivalence.
+
+    Args:
+        chunk: String to check
+        motif: Motif pattern to match against
+        handle_iupac: Whether to use IUPAC intersection matching
+
+    Returns:
+        bool: True if chunk matches motif
+    """
+    if len(chunk) != len(motif):
+        return False
+    for c1, c2 in zip(chunk, motif):
+        is_match, _ = _are_nucleotides_equivalent(c1, c2, handle_iupac)
+        if not is_match:
+            return False
+    return True
+
+
+def _analyze_allele(allele, left_context, right_context, max_motif_length, handle_iupac):
+    """
+    Analyze an allele to determine what portions are repeat extensions.
+
+    Uses split scoring: portions matching context are extensions, remainder is core.
+    Supports IUPAC equivalence for extension matching.
+
+    Args:
+        allele: The allele string to analyze
+        left_context: Context from left of variant range (or None)
+        right_context: Context from right of variant range (or None)
+        max_motif_length: Maximum motif length to try
+        handle_iupac: Whether to use IUPAC intersection matching
+
+    Returns:
+        AlleleAnalysis: Analysis result with extension counts and core content
+    """
+    if not allele:
+        return AlleleAnalysis(0, 0, '', True)  # Empty allele = pure extension
+
+    chars = list(allele)
+    n = len(chars)
+    left_consumed = 0
+    right_consumed = 0
+
+    # LEFT EXTENSION: Try different motif lengths (largest first)
+    if left_context:
+        for motif_len in range(min(max_motif_length, len(left_context)), 0, -1):
+            motif = left_context[-motif_len:]  # Last motif_len chars of left context
+
+            # Check for degenerate case (homopolymer disguised as longer motif)
+            if len(set(motif.upper())) == 1:
+                motif = motif[0]
+                motif_len = 1
+
+            # Count complete motif matches from left
+            consumed = 0
+            pos = 0
+            while pos + motif_len <= n:
+                chunk = ''.join(chars[pos:pos + motif_len])
+                if _motif_matches(chunk, motif, handle_iupac):
+                    consumed += motif_len
+                    pos += motif_len
+                else:
+                    break
+
+            if consumed > 0:
+                left_consumed = consumed
+                break
+
+    # RIGHT EXTENSION: Try different motif lengths (largest first)
+    if right_context:
+        remaining_start = left_consumed
+        remaining_chars = chars[remaining_start:]
+
+        for motif_len in range(min(max_motif_length, len(right_context)), 0, -1):
+            motif = right_context[:motif_len]  # First motif_len chars of right context
+
+            # Check for degenerate case
+            if len(set(motif.upper())) == 1:
+                motif = motif[0]
+                motif_len = 1
+
+            # Count complete motif matches from right
+            consumed = 0
+            pos = len(remaining_chars)
+
+            while pos >= motif_len:
+                chunk = ''.join(remaining_chars[pos - motif_len:pos])
+                if _motif_matches(chunk, motif, handle_iupac):
+                    consumed += motif_len
+                    pos -= motif_len
+                else:
+                    break
+
+            if consumed > 0:
+                right_consumed = consumed
+                break
+
+    # Core content is what remains
+    core_start = left_consumed
+    core_end = n - right_consumed
+    core_content = ''.join(chars[core_start:core_end]) if core_end > core_start else ''
+
+    return AlleleAnalysis(
+        left_extension_count=left_consumed,
+        right_extension_count=right_consumed,
+        core_content=core_content,
+        is_pure_extension=(len(core_content) == 0)
+    )
+
+
+def _find_variant_ranges(seq1_aligned, seq2_aligned, scoring_start, scoring_end, handle_iupac):
+    """
+    Find all variant ranges within the scoring region.
+
+    A variant range is a maximal contiguous region where at least one position
+    is NOT a non-gap match or dual-gap. Bounded by match positions on left/right.
+
+    Args:
+        seq1_aligned, seq2_aligned: Aligned sequences with gaps
+        scoring_start, scoring_end: Scoring region boundaries (inclusive)
+        handle_iupac: Whether to use IUPAC intersection matching
+
+    Returns:
+        List of tuples: [(start, end, left_bound_pos, right_bound_pos), ...]
+        where start/end are inclusive positions of the variant range,
+        and bound positions point to the bounding match positions (-1 if none).
+    """
+    variant_ranges = []
+    i = scoring_start
+
+    def is_match_position(pos):
+        """Check if position is a match (including dual-gaps)."""
+        c1, c2 = seq1_aligned[pos], seq2_aligned[pos]
+        # Dual-gaps are matches
+        if c1 == '-' and c2 == '-':
+            return True
+        # Both non-gap and equivalent
+        if c1 != '-' and c2 != '-':
+            is_match, _ = _are_nucleotides_equivalent(c1, c2, handle_iupac)
+            return is_match
+        # Single-sided gap is not a match
+        return False
+
+    while i <= scoring_end:
+        if is_match_position(i):
+            i += 1
+            continue
+
+        # Found start of variant range
+        variant_start = i
+        # Left bound is the position just before variant start (if within scoring region)
+        left_bound_pos = i - 1 if i > scoring_start else -1
+
+        # Scan to find end of variant range
+        while i <= scoring_end:
+            if is_match_position(i):
+                break
+            i += 1
+
+        variant_end = i - 1
+        # Right bound is the position just after variant end (if within scoring region)
+        right_bound_pos = i if i <= scoring_end else -1
+
+        variant_ranges.append((variant_start, variant_end, left_bound_pos, right_bound_pos))
+
+    return variant_ranges
+
+
+def _score_variant_range(allele1, analysis1, allele2, analysis2, adjustment_params):
+    """
+    Score a variant range given two allele analyses using Occam's razor.
+
+    Scoring rules (when normalize_homopolymers=True):
+    - Both pure extensions → 0 edits (homopolymer equivalent)
+    - One pure extension, other has core → score the core as edits
+    - Both have core → compare cores
+
+    When normalize_homopolymers=False:
+    - Extensions are treated as regular indels
+
+    Args:
+        allele1, allele2: The allele strings
+        analysis1, analysis2: AlleleAnalysis for each allele
+        adjustment_params: AdjustmentParams for scoring behavior
+
+    Returns:
+        dict: {
+            'edits': int,
+            'scored_positions': int,
+            'both_pure_extension': bool
+        }
+    """
+    # When homopolymer normalization is disabled, treat extensions as indels
+    if not adjustment_params.normalize_homopolymers:
+        # Total content from both alleles (treating as a regular indel region)
+        total_len = max(len(allele1), len(allele2))
+        if total_len == 0:
+            return {'edits': 0, 'scored_positions': 0, 'both_pure_extension': False}
+
+        if adjustment_params.normalize_indels:
+            return {
+                'edits': 1,
+                'scored_positions': 1,
+                'both_pure_extension': False
+            }
+        else:
+            return {
+                'edits': total_len,
+                'scored_positions': total_len,
+                'both_pure_extension': False
+            }
+
+    # Both pure extensions -> homopolymer equivalent
+    if analysis1.is_pure_extension and analysis2.is_pure_extension:
+        return {
+            'edits': 0,
+            'scored_positions': 0,
+            'both_pure_extension': True
+        }
+
+    # One pure extension, other has core -> count core as edits
+    if analysis1.is_pure_extension:
+        core = analysis2.core_content
+        if adjustment_params.normalize_indels:
+            return {
+                'edits': 1 if core else 0,
+                'scored_positions': 1 if core else 0,
+                'both_pure_extension': False
+            }
+        else:
+            return {
+                'edits': len(core),
+                'scored_positions': len(core),
+                'both_pure_extension': False
+            }
+
+    if analysis2.is_pure_extension:
+        core = analysis1.core_content
+        if adjustment_params.normalize_indels:
+            return {
+                'edits': 1 if core else 0,
+                'scored_positions': 1 if core else 0,
+                'both_pure_extension': False
+            }
+        else:
+            return {
+                'edits': len(core),
+                'scored_positions': len(core),
+                'both_pure_extension': False
+            }
+
+    # Both have core -> compare cores
+    core1, core2 = analysis1.core_content, analysis2.core_content
+
+    if core1 == core2:
+        # Cores are identical - just extension differences
+        return {
+            'edits': 0,
+            'scored_positions': len(core1),
+            'both_pure_extension': False
+        }
+
+    # Cores differ - compute edit count
+    min_len = min(len(core1), len(core2))
+    max_len = max(len(core1), len(core2))
+
+    # Count substitutions in overlapping region
+    substitutions = sum(1 for i in range(min_len)
+                        if not _are_nucleotides_equivalent(core1[i], core2[i],
+                                                          adjustment_params.handle_iupac_overlap)[0])
+
+    # Handle length difference as indel
+    if max_len > min_len:
+        if adjustment_params.normalize_indels:
+            indel_edits = 1
+            indel_scored = 1
+        else:
+            indel_edits = max_len - min_len
+            indel_scored = max_len - min_len
+    else:
+        indel_edits = 0
+        indel_scored = 0
+
+    return {
+        'edits': substitutions + indel_edits,
+        'scored_positions': min_len + indel_scored,
+        'both_pure_extension': False
+    }
+
+
+def _generate_variant_score_string(seq1_aligned, seq2_aligned, start, end,
+                                    analysis1, analysis2, allele1_positions, allele2_positions,
+                                    scoring_format, adjustment_params):
+    """
+    Generate score_aligned string for a variant range.
+    Maps analyzed allele components back to alignment positions.
+
+    Args:
+        seq1_aligned, seq2_aligned: Aligned sequences
+        start, end: Variant range boundaries (inclusive)
+        analysis1, analysis2: AlleleAnalysis for each allele
+        allele1_positions, allele2_positions: Source positions for each allele's chars
+        scoring_format: ScoringFormat for visualization
+        adjustment_params: AdjustmentParams for scoring behavior
+
+    Returns:
+        str: Score string for this variant range
+    """
+    # Build position classification sets for seq1
+    seq1_left_ext_positions = set(allele1_positions[:analysis1.left_extension_count])
+    seq1_right_ext_positions = set(allele1_positions[-analysis1.right_extension_count:]
+                                   if analysis1.right_extension_count > 0 else [])
+
+    # Build position classification sets for seq2
+    seq2_left_ext_positions = set(allele2_positions[:analysis2.left_extension_count])
+    seq2_right_ext_positions = set(allele2_positions[-analysis2.right_extension_count:]
+                                   if analysis2.right_extension_count > 0 else [])
+
+    # Calculate core positions for each allele
+    core1_start = analysis1.left_extension_count
+    core1_end = len(allele1_positions) - analysis1.right_extension_count
+    seq1_core_positions = set(allele1_positions[core1_start:core1_end]) if core1_end > core1_start else set()
+
+    core2_start = analysis2.left_extension_count
+    core2_end = len(allele2_positions) - analysis2.right_extension_count
+    seq2_core_positions = set(allele2_positions[core2_start:core2_end]) if core2_end > core2_start else set()
+
+    score_chars = []
+    core_indel_count = 0  # Track for indel extension visualization
+
+    for pos in range(start, end + 1):
+        char1 = seq1_aligned[pos]
+        char2 = seq2_aligned[pos]
+
+        # Dual-gap
+        if char1 == '-' and char2 == '-':
+            score_chars.append(scoring_format.match)
+            continue
+
+        # Check if this position is an extension in either sequence
+        is_ext1 = pos in seq1_left_ext_positions or pos in seq1_right_ext_positions
+        is_ext2 = pos in seq2_left_ext_positions or pos in seq2_right_ext_positions
+
+        # Check if this position is in core of either sequence
+        is_core1 = pos in seq1_core_positions
+        is_core2 = pos in seq2_core_positions
+
+        if is_ext1 or is_ext2:
+            # Extension position - show as homopolymer extension if normalizing
+            if adjustment_params.normalize_homopolymers:
+                score_chars.append(scoring_format.homopolymer_extension)
+            else:
+                # Without normalization, show as indel
+                score_chars.append(scoring_format.indel_start)
+        elif char1 == '-' or char2 == '-':
+            # Indel in core region
+            if core_indel_count == 0 or not adjustment_params.normalize_indels:
+                score_chars.append(scoring_format.indel_start)
+            else:
+                score_chars.append(scoring_format.indel_extension)
+            core_indel_count += 1
+        else:
+            # Both have content - compare
+            is_match, is_ambig = _are_nucleotides_equivalent(
+                char1, char2, adjustment_params.handle_iupac_overlap)
+            if is_match:
+                score_chars.append(scoring_format.ambiguous_match if is_ambig else scoring_format.match)
+            else:
+                score_chars.append(scoring_format.substitution)
+
+    return ''.join(score_chars)
+
 
 def _process_indel_left_right(seq1_aligned, seq2_aligned, start, end, adjustment_params, scoring_format):
     """
@@ -400,94 +942,98 @@ def _process_indel_left_right(seq1_aligned, seq2_aligned, start, end, adjustment
             'scored_positions': 0,
             'all_homopolymer': False
         }
-    
-    # Determine which sequence has gaps (the context sequence)
-    gap_in_seq1 = (seq1_aligned[start] == '-')
-    context_seq = seq2_aligned if gap_in_seq1 else seq1_aligned
-    
+
     # LEFT SIDE PROCESSING - Try different context lengths
+    # Use MSA-compatible context extraction that handles dual-gaps and enforces consensus
     left_repeat_count = 0
     left_context_length = 0
     max_motif_length = adjustment_params.max_repeat_motif_length
-    
-    for try_length in range(min(max_motif_length, start), 0, -1):
-        if start >= try_length:
-            left_context = context_seq[start - try_length:start]
-            
-            # Check for degenerate case (homopolymer disguised as longer motif)
-            if len(set(left_context)) == 1:
-                # It's actually a homopolymer, use length 1
-                left_context = left_context[0]
-                actual_length = 1
-            else:
-                actual_length = try_length
-            
-            # Count how many complete motifs we can consume from left
-            consumed = 0
-            while consumed + actual_length <= len(indel_chars):
-                if actual_length == 1:
-                    # Single character comparison
-                    if indel_chars[consumed] == left_context:
-                        consumed += 1
-                    else:
-                        break
+
+    for try_length in range(max_motif_length, 0, -1):
+        # Extract context using consensus-based helper (MSA-compatible)
+        left_context = _extract_left_context(seq1_aligned, seq2_aligned, start, try_length)
+
+        if left_context is None:
+            continue  # Insufficient context or sequences disagree - try smaller length
+
+        # Check for degenerate case (homopolymer disguised as longer motif)
+        if len(set(left_context)) == 1:
+            # It's actually a homopolymer, use length 1
+            left_context = left_context[0]
+            actual_length = 1
+        else:
+            actual_length = try_length
+
+        # Count how many complete motifs we can consume from left
+        consumed = 0
+        while consumed + actual_length <= len(indel_chars):
+            if actual_length == 1:
+                # Single character comparison
+                if indel_chars[consumed] == left_context:
+                    consumed += 1
                 else:
-                    # Multi-character motif comparison
-                    chunk = ''.join(indel_chars[consumed:consumed + actual_length])
-                    if chunk == left_context:
-                        consumed += actual_length
-                    else:
-                        break
-            
-            if consumed > 0:
-                left_repeat_count = consumed
-                left_context_length = actual_length
-                break  # Found a working context length
+                    break
+            else:
+                # Multi-character motif comparison
+                chunk = ''.join(indel_chars[consumed:consumed + actual_length])
+                if chunk == left_context:
+                    consumed += actual_length
+                else:
+                    break
+
+        if consumed > 0:
+            left_repeat_count = consumed
+            left_context_length = actual_length
+            break  # Found a working context length
     
     # RIGHT SIDE PROCESSING - Independent of left side
+    # Use MSA-compatible context extraction that handles dual-gaps and enforces consensus
     right_repeat_count = 0
     right_context_length = 0
-    
+
     # Calculate remaining indel after left consumption
     remaining_start = left_repeat_count
     remaining_chars = indel_chars[remaining_start:]
-    
-    for try_length in range(min(max_motif_length, len(context_seq) - end - 1), 0, -1):
-        if end + try_length < len(context_seq):
-            right_context = context_seq[end + 1:end + 1 + try_length]
-            
-            # Check for degenerate case
-            if len(set(right_context)) == 1:
-                right_context = right_context[0]
-                actual_length = 1
-            else:
-                actual_length = try_length
-            
-            # Count from right side of remaining indel
-            consumed = 0
-            pos = len(remaining_chars)
-            
-            while pos >= actual_length:
-                if actual_length == 1:
-                    # Single character comparison
-                    if remaining_chars[pos - 1] == right_context:
-                        consumed += 1
-                        pos -= 1
-                    else:
-                        break
+
+    for try_length in range(max_motif_length, 0, -1):
+        # Extract context using consensus-based helper (MSA-compatible)
+        right_context = _extract_right_context(seq1_aligned, seq2_aligned, end, try_length)
+
+        if right_context is None:
+            continue  # Insufficient context or sequences disagree - try smaller length
+
+        # Check for degenerate case
+        if len(set(right_context)) == 1:
+            right_context = right_context[0]
+            actual_length = 1
+        else:
+            actual_length = try_length
+
+        # Count from right side of remaining indel
+        consumed = 0
+        pos = len(remaining_chars)
+
+        while pos >= actual_length:
+            if actual_length == 1:
+                # Single character comparison
+                if remaining_chars[pos - 1] == right_context:
+                    consumed += 1
+                    pos -= 1
                 else:
-                    # Multi-character motif comparison
-                    chunk = ''.join(remaining_chars[pos - actual_length:pos])
-                    if chunk == right_context:
-                        consumed += actual_length
-                        pos -= actual_length
-                    else:
-                        break
-            
-            if consumed > 0:
-                right_repeat_count = consumed
-                right_context_length = actual_length
-                break
+                    break
+            else:
+                # Multi-character motif comparison
+                chunk = ''.join(remaining_chars[pos - actual_length:pos])
+                if chunk == right_context:
+                    consumed += actual_length
+                    pos -= actual_length
+                else:
+                    break
+
+        if consumed > 0:
+            right_repeat_count = consumed
+            right_context_length = actual_length
+            break
     
     # Calculate middle (non-repeat) portion
     middle_indel_count = len(indel_chars) - left_repeat_count - right_repeat_count
@@ -656,71 +1202,119 @@ def score_alignment(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_
         seq1_aligned, seq2_aligned, adjustment_params.end_skip_distance
     )
 
-    i = 0
+    # =========================================================================
+    # Variant Range Algorithm (v0.2.0)
+    # =========================================================================
+    # Process alignment by:
+    # 1. Add end-trimmed markers for positions outside scoring region
+    # 2. Find variant ranges (contiguous non-match regions)
+    # 3. Process match positions and variant ranges
 
-    while i < total_alignment_length:
-        seq1_char = seq1_aligned[i]
-        seq2_char = seq2_aligned[i]
+    # Add end-trimmed markers for positions before scoring region
+    for i in range(scoring_start):
+        score_aligned.append(scoring_format.end_trimmed)
 
-        # Check if outside scoring region (end mismatch skipping)
-        if i < scoring_start or i > scoring_end:
-            # Add scoring code for skipped region
-            score_aligned.append(scoring_format.end_trimmed)
-            i += 1
-            continue
+    # Find all variant ranges within the scoring region
+    variant_ranges = _find_variant_ranges(
+        seq1_aligned, seq2_aligned, scoring_start, scoring_end,
+        adjustment_params.handle_iupac_overlap
+    )
 
-        # We're in the scoring region
+    # Build a set of positions that are in variant ranges for quick lookup
+    variant_positions = set()
+    for vr_start, vr_end, _, _ in variant_ranges:
+        for pos in range(vr_start, vr_end + 1):
+            variant_positions.add(pos)
 
-        # Check for exact match or IUPAC equivalence
-        is_equivalent, is_ambiguous = _are_nucleotides_equivalent(seq1_char, seq2_char, adjustment_params.handle_iupac_overlap)
+    # Process each position in the scoring region
+    pos = scoring_start
+    vr_index = 0  # Current variant range index
 
-        if is_equivalent:
-            # Match - no edit
+    while pos <= scoring_end:
+        # Check if this position starts a variant range
+        if vr_index < len(variant_ranges) and pos == variant_ranges[vr_index][0]:
+            vr_start, vr_end, left_bound, right_bound = variant_ranges[vr_index]
+
+            # Extract alleles from both sequences
+            allele1, allele1_positions = _extract_allele(seq1_aligned, vr_start, vr_end)
+            allele2, allele2_positions = _extract_allele(seq2_aligned, vr_start, vr_end)
+
+            # Get context for homopolymer detection
+            # Try different context lengths (largest to smallest) until we get valid context
+            max_ctx_len = adjustment_params.max_repeat_motif_length
+            left_context = None
+            right_context = None
+
+            if left_bound >= 0:
+                for ctx_len in range(max_ctx_len, 0, -1):
+                    left_context = _extract_left_context(
+                        seq1_aligned, seq2_aligned, vr_start, ctx_len)
+                    if left_context is not None:
+                        break
+
+            if right_bound >= 0:
+                for ctx_len in range(max_ctx_len, 0, -1):
+                    right_context = _extract_right_context(
+                        seq1_aligned, seq2_aligned, vr_end, ctx_len)
+                    if right_context is not None:
+                        break
+
+            # Analyze alleles
+            analysis1 = _analyze_allele(
+                allele1, left_context, right_context,
+                adjustment_params.max_repeat_motif_length,
+                adjustment_params.handle_iupac_overlap
+            )
+            analysis2 = _analyze_allele(
+                allele2, left_context, right_context,
+                adjustment_params.max_repeat_motif_length,
+                adjustment_params.handle_iupac_overlap
+            )
+
+            # Score the variant range using Occam's razor
+            vr_score = _score_variant_range(
+                allele1, analysis1, allele2, analysis2, adjustment_params
+            )
+
+            edits += vr_score['edits']
+            scored_positions += vr_score['scored_positions']
+
+            # Generate score string for this variant range
+            vr_score_string = _generate_variant_score_string(
+                seq1_aligned, seq2_aligned, vr_start, vr_end,
+                analysis1, analysis2, allele1_positions, allele2_positions,
+                scoring_format, adjustment_params
+            )
+            score_aligned.append(vr_score_string)
+
+            # Move past this variant range
+            pos = vr_end + 1
+            vr_index += 1
+
+        else:
+            # This is a match position (both non-gap and equivalent, or dual-gap)
+            char1, char2 = seq1_aligned[pos], seq2_aligned[pos]
+
+            # Check for dual-gap (treated as match)
+            if char1 == '-' and char2 == '-':
+                scored_positions += 1
+                score_aligned.append(scoring_format.match)
+                pos += 1
+                continue
+
+            is_match, is_ambiguous = _are_nucleotides_equivalent(
+                char1, char2, adjustment_params.handle_iupac_overlap)
+
             scored_positions += 1
-            # Use appropriate scoring code based on match type
             if is_ambiguous:
                 score_aligned.append(scoring_format.ambiguous_match)
             else:
                 score_aligned.append(scoring_format.match)
-            i += 1
-        elif seq1_char == '-' or seq2_char == '-':
-            # Start of an indel region - find end of contiguous gaps in the same sequence
-            indel_start = i
-            gap_in_seq1 = (seq1_char == '-')  # Track which sequence has the gap
+            pos += 1
 
-            # Find the end of this indel region (gaps must stay in the same sequence)
-            while i < total_alignment_length:
-                seq1_has_gap = (seq1_aligned[i] == '-')
-                seq2_has_gap = (seq2_aligned[i] == '-')
-                
-                # Must be an indel position and gap must be in the same sequence as when we started
-                if (seq1_has_gap or seq2_has_gap) and (seq1_has_gap == gap_in_seq1):
-                    i += 1
-                else:
-                    break  # Gap switched sequences or we hit a match
-
-            indel_end = i - 1
-            indel_length = indel_end - indel_start + 1
-
-            # We'll count scored positions after determining if it's a homopolymer
-
-            # Process indel using left-right homopolymer extension algorithm
-            indel_result = _process_indel_left_right(
-                seq1_aligned, seq2_aligned, indel_start, indel_end, 
-                adjustment_params, scoring_format
-            )
-            
-            # Add results from indel processing
-            edits += indel_result['edits']
-            scored_positions += indel_result['scored_positions']
-            score_aligned.append(indel_result['score_string'])
-            
-        else:
-            # Substitution - count normally (scoring region already checked above)
-            scored_positions += 1
-            edits += 1
-            score_aligned.append(scoring_format.substitution)
-            i += 1
+    # Add end-trimmed markers for positions after scoring region
+    for i in range(scoring_end + 1, total_alignment_length):
+        score_aligned.append(scoring_format.end_trimmed)
 
     # Calculate coverage as fraction of sequence used in alignment region
     seq1_coverage = seq1_coverage_positions / seq1_total_length if seq1_total_length > 0 else 0.0

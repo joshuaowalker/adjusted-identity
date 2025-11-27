@@ -9,6 +9,7 @@ A Python package implementing MycoBLAST-style sequence identity calculations for
 - **Homopolymer Length Normalization**: Ignore differences in homopolymer run lengths (e.g., "AAA" vs "AAAA")
 - **Repeat Motif Adjustment**: Handle dinucleotide and longer repeat motifs (e.g., "ATATAT" vs "ATATATAT")
 - **IUPAC Ambiguity Code Handling**: Allow different ambiguity codes to match via nucleotide intersection
+- **MSA Dual-Gap Support**: Correctly handle sequences from multi-sequence alignments (MSA) where both sequences may have gaps at the same position
 - **End Trimming**: Skip mismatches in terminal regions to avoid sequencing artifacts (automatic for sequences >40bp)
 - **Indel Normalization**: Count contiguous indels as single evolutionary events
 - **Comprehensive Alignment**: Multi-stage bidirectional alignment optimization using edlib
@@ -106,7 +107,7 @@ print(f"Score pattern: {result.score_aligned}")  # Shows '=' for ambiguous match
 
 The `score_aligned` field provides a visual representation of how each position was scored:
 
-- `|` = Exact match between standard nucleotides (A=A, C=C, G=G, T=T)
+- `|` = Exact match between standard nucleotides (A=A, C=C, G=G, T=T) or dual-gap ('-' vs '-')
 - `=` = Ambiguous match (IUPAC codes) or homopolymer extension
 - ` ` (space) = Substitution (mismatch)
 - `-` = Indel extension (normalized)
@@ -144,6 +145,35 @@ params = AdjustmentParams(
 )
 result = align_and_score("CAGCAG---TTC", "CAGCAGCAGTTC", params)
 ```
+
+### Multi-Sequence Alignment (MSA) Support
+
+The package correctly handles sequence pairs extracted from multi-sequence alignments (MSA), where both sequences may have gaps at the same position due to alignment with third sequences.
+
+```python
+from adjusted_identity import score_alignment
+
+# Sequences from MSA (e.g., spoa, MUSCLE, MAFFT output)
+# Both sequences have gaps at positions 3-4 due to alignment with a third sequence
+msa_seq1 = "AGA--TT"
+msa_seq2 = "AGAT-TT"
+
+result = score_alignment(msa_seq1, msa_seq2)
+print(f"MSA identity: {result.identity:.3f}")  # Should be 1.0 - 'T' recognized as homopolymer
+print(f"Score pattern: {result.score_aligned}")
+
+# Another example with consensus-based homopolymer detection
+msa_seq1 = "AGG-AC"  # G at position 2
+msa_seq2 = "AG-GAC"  # G at position 3
+
+result = score_alignment(msa_seq1, msa_seq2)
+print(f"MSA identity: {result.identity:.3f}")  # Both G's recognized as homopolymer extensions
+```
+
+**Key MSA features:**
+- **Dual-gap handling**: Positions where both sequences have '-' are treated as matches
+- **Consensus context**: Homopolymer detection uses consensus nucleotides from both sequences
+- **Conflict resolution**: When sequences disagree at context positions, homopolymer extension is not applied
 
 ### Custom Adjustments
 
@@ -538,6 +568,28 @@ Mycota Lab. https://mycotalab.substack.com/p/why-ncbi-blast-identity-scores-can
 BSD 2-Clause License - see [LICENSE](LICENSE) file for details.
 
 ## Changelog
+
+### Version 0.2.0
+- **Major Enhancement**: Implemented variant range algorithm for improved homopolymer and repeat motif detection
+- **Key behavioral change**: Alternating indel patterns like `TGC-C-TC` vs `TGCT--TC` now correctly score as identity=1.0
+  - The algorithm recognizes that C extends the left C context and T extends the right T context
+  - Both alleles are valid repeat extensions → 0 edits (Occam's razor principle)
+- **Algorithm improvements**:
+  - Variant regions are now bounded by non-gap match positions (respects alignment boundaries)
+  - Alleles extracted from variant ranges are analyzed for left/right repeat extensions
+  - Split scoring: partial extensions allowed (e.g., "AAG" where "AA" extends context scores AA as 0 edits, G as 1 edit)
+  - Opposite direction extensions are valid (allele1 extending left + allele2 extending right = both valid)
+- **IUPAC integration**: Motif matching uses `_are_nucleotides_equivalent()` so IUPAC codes can extend context
+- No API changes - existing code works unchanged but may see improved identity scores for complex indel patterns
+
+### Version 0.1.7
+- **Feature**: Added multi-sequence alignment (MSA) dual-gap support for homopolymer normalization
+- Consensus-based context extraction now handles sequences where both have gaps at the same position (common in MSA outputs from spoa, MUSCLE, MAFFT)
+- Dual-gap positions ('-' vs '-') are now correctly treated as matches, not indels
+- Homopolymer detection uses consensus from both sequences when extracting context
+- Added 17 comprehensive tests for MSA edge cases
+- 100% backward compatible - all 133 tests pass
+- No API changes - existing code works unchanged
 
 ### Version 0.1.6
 - **Enhancement**: Added validation for contradictory `AdjustmentParams` configuration

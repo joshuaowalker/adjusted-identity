@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "adjusted-identity"
-version = "0.1.5"
+version = "0.2.0"
 authors = [{name = "Josh Walker", email = "joshowalker@yahoo.com"}]
-description = "Adjusted Identity Calculator for DNA Sequences with MycoBLAST-style preprocessing"
+description = "Adjusted Identity Calculator for DNA Sequences with MycoBLAST-style preprocessing and MSA support"
 readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.8"
