@@ -27,7 +27,7 @@ class TestDataClasses:
         assert params.normalize_homopolymers is True
         assert params.handle_iupac_overlap is True
         assert params.normalize_indels is True
-        assert params.end_skip_distance == 20
+        assert params.end_skip_distance == 0
     
     def test_adjustment_params_custom(self):
         """Test custom AdjustmentParams values."""

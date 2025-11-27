@@ -133,7 +133,7 @@ class AdjustmentParams:
     normalize_homopolymers: bool = True      # Ignore homopolymer length differences
     handle_iupac_overlap: bool = True        # Allow different ambiguity codes to match via intersection
     normalize_indels: bool = True            # Count contiguous indels as single events
-    end_skip_distance: int = 20              # Nucleotides to skip from each end (0 to disable)
+    end_skip_distance: int = 0               # Nucleotides to skip from each end (0 = disabled by default)
     max_repeat_motif_length: int = 2         # Maximum repeat motif length to detect (default: dinucleotides)
 
     def __post_init__(self):

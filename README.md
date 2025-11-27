@@ -10,7 +10,7 @@ A Python package implementing MycoBLAST-style sequence identity calculations for
 - **Repeat Motif Adjustment**: Handle dinucleotide and longer repeat motifs (e.g., "ATATAT" vs "ATATATAT")
 - **IUPAC Ambiguity Code Handling**: Allow different ambiguity codes to match via nucleotide intersection
 - **MSA Dual-Gap Support**: Correctly handle sequences from multi-sequence alignments (MSA) where both sequences may have gaps at the same position
-- **End Trimming**: Skip mismatches in terminal regions to avoid sequencing artifacts (automatic for sequences >40bp)
+- **End Trimming**: Skip mismatches in terminal regions to avoid sequencing artifacts (disabled by default, set `end_skip_distance` to enable)
 - **Indel Normalization**: Count contiguous indels as single evolutionary events
 - **Comprehensive Alignment**: Multi-stage bidirectional alignment optimization using edlib
 - **Flexible Configuration**: Enable/disable individual adjustments as needed
@@ -185,7 +185,7 @@ custom_params = AdjustmentParams(
     normalize_homopolymers=True,   # Enable homopolymer adjustment
     handle_iupac_overlap=False,    # Disable IUPAC intersection
     normalize_indels=True,         # Enable indel normalization
-    end_skip_distance=10,         # Skip 10bp from each end (instead of default 20)
+    end_skip_distance=10,         # Skip 10bp from each end (default is 0 = disabled)
     max_repeat_motif_length=2     # Detect up to dinucleotide repeats (default)
 )
 
@@ -281,7 +281,7 @@ AdjustmentParams(
     normalize_homopolymers=True,    # Ignore homopolymer length differences
     handle_iupac_overlap=True,      # Allow IUPAC ambiguity intersections
     normalize_indels=True,          # Count contiguous indels as single events
-    end_skip_distance=20,          # Skip first/last N nucleotides (not positions) from scoring
+    end_skip_distance=0,           # Skip first/last N nucleotides (0 = disabled by default)
     max_repeat_motif_length=2      # Maximum repeat motif length to detect (1=homopolymers only, 2=dinucleotides, etc.)
 )
 ```
@@ -418,7 +418,7 @@ from adjusted_identity import align_and_score, AdjustmentParams
 # Short sequences (< 2 × end_skip_distance nucleotides): NO trimming applied
 short_seq1 = "ATCGATCG"      # 8 nucleotides 
 short_seq2 = "ATCGATCG"      # 8 nucleotides
-result = align_and_score(short_seq1, short_seq2)  # Uses default end_skip_distance=20
+result = align_and_score(short_seq1, short_seq2)  # end_skip_distance=0 by default
 print(f"Scored positions: {result.scored_positions}")  # 8 (full sequence)
 print(f"Score pattern: {result.score_aligned}")        # "||||||||" (no trimming dots)
 
@@ -580,7 +580,8 @@ BSD 2-Clause License - see [LICENSE](LICENSE) file for details.
   - Split scoring: partial extensions allowed (e.g., "AAG" where "AA" extends context scores AA as 0 edits, G as 1 edit)
   - Opposite direction extensions are valid (allele1 extending left + allele2 extending right = both valid)
 - **IUPAC integration**: Motif matching uses `_are_nucleotides_equivalent()` so IUPAC codes can extend context
-- No API changes - existing code works unchanged but may see improved identity scores for complex indel patterns
+- **Breaking change**: `end_skip_distance` now defaults to 0 (disabled). Set `end_skip_distance=20` to restore previous behavior.
+- Removed 218 lines of dead code from previous indel processing implementation
 
 ### Version 0.1.7
 - **Feature**: Added multi-sequence alignment (MSA) dual-gap support for homopolymer normalization

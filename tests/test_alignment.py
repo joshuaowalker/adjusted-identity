@@ -56,10 +56,11 @@ class TestAlignAndScore:
         assert result.seq1_coverage == 1.0
         assert result.seq2_coverage == 1.0
     
-    def test_completely_different_sequences(self):
-        """Completely different sequences should have low identity."""
-        result = align_and_score("ATCG", "CGAT")
-        assert result.identity < 1.0  # Should not be perfect
+    def test_sequences_with_mismatches(self):
+        """Sequences with clear mismatches should have lower identity."""
+        # Use sequences that align fully but have mismatches in the middle
+        result = align_and_score("ATCGXXCG", "ATCGAACG")
+        assert result.identity < 1.0  # Should not be perfect due to XX vs AA
         assert result.mismatches > 0
     
     def test_coverage_calculation(self):

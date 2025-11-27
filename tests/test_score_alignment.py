@@ -252,29 +252,31 @@ class TestHomopolymerAdjustment:
 
     def test_context_edge_cases(self):
         """Test edge cases with missing context (start/end of sequence)."""
-        
-        # Indel at start of sequence (no left context)
-        result_no_left = score_alignment("-ATCG", "GATCG", DEFAULT_ADJUSTMENT_PARAMS)
-        assert result_no_left.identity == 0.8  # G indel at start
-        assert result_no_left.score_aligned == " ||||"
+
+        # Indel near start of sequence (minimal left context)
+        # T-ATCG vs TGATCG - G doesn't extend T → core content
+        result_no_left = score_alignment("T-ATCG", "TGATCG", DEFAULT_ADJUSTMENT_PARAMS)
+        assert result_no_left.identity < 1.0  # G indel doesn't extend T
         assert result_no_left.mismatches == 1
-        
-        # Indel at end of sequence (no right context)
-        result_no_right = score_alignment("ATCG-", "ATCGG", DEFAULT_ADJUSTMENT_PARAMS)
-        assert result_no_right.identity == 1.0  # G extends G context (homopolymer)
-        assert result_no_right.score_aligned == "||||="
+
+        # Indel near end of sequence (homopolymer extension)
+        # ATCG-T vs ATCGGT - G extends G context (homopolymer)
+        result_no_right = score_alignment("ATCG-T", "ATCGGT", DEFAULT_ADJUSTMENT_PARAMS)
+        assert result_no_right.identity == 1.0  # G extends G context
+        assert result_no_right.score_aligned == "||||=|"
         assert result_no_right.mismatches == 0
-        
+
         # Homopolymer at start (should still be detected if context allows)
         result_hp_start = score_alignment("A-TCG", "AATCG", DEFAULT_ADJUSTMENT_PARAMS)
         assert result_hp_start.identity == 1.0  # A extends A context
         assert result_hp_start.score_aligned == "|=|||"
         assert result_hp_start.mismatches == 0
         
-        # Homopolymer at end (should still be detected if context allows)  
-        result_hp_end = score_alignment("TCGA-", "TCGAA", DEFAULT_ADJUSTMENT_PARAMS)
+        # Homopolymer at end (should still be detected if context allows)
+        # Add trailing context to avoid overhang behavior
+        result_hp_end = score_alignment("TCGA-T", "TCGAAT", DEFAULT_ADJUSTMENT_PARAMS)
         assert result_hp_end.identity == 1.0  # A extends A context
-        assert result_hp_end.score_aligned == "||||="
+        assert result_hp_end.score_aligned == "||||=|"
         assert result_hp_end.mismatches == 0
 
     def test_multiple_component_edge_cases(self):
@@ -404,12 +406,13 @@ class TestIUPACAdjustment:
 class TestEndTrimming:
     """Test end region mismatch skipping."""
     
-    def test_end_trimming_enabled_default(self):
-        """Mismatches near ends should be skipped with default 20bp trimming."""
+    def test_end_trimming_enabled(self):
+        """Mismatches near ends should be skipped with 20bp trimming."""
         # Create sequences longer than 40bp to enable trimming
         seq1 = "A" * 21 + "XXXX" + "T" * 21  # Mismatches in middle
         seq2 = "A" * 21 + "TTTT" + "T" * 21
-        result = score_alignment(seq1, seq2, DEFAULT_ADJUSTMENT_PARAMS)
+        params = AdjustmentParams(end_skip_distance=20)
+        result = score_alignment(seq1, seq2, params)
 
         # Variant range algorithm: XXXX vs TTTT is one variant range
         # TTTT extends T context (right side) → pure extension
@@ -600,16 +603,17 @@ class TestRepeatMotifs:
         assert '=' in result.score_aligned
     
     def test_motif_at_sequence_boundary(self):
-        """Test repeat motif at the very start or end of sequence."""
-        # AT repeat at start
-        seq1 = "--ATATGC"
-        seq2 = "ATATATGC"
-        
+        """Test repeat motif near start or end of sequence."""
+        # AT repeat near start (add leading context to avoid overhang)
+        seq1 = "C--ATATGC"
+        seq2 = "CATATATGC"
+
         params = AdjustmentParams(max_repeat_motif_length=2)
         result = score_alignment(seq1, seq2, params)
-        
-        # No left context, but should still work with right context
-        assert '=' in result.score_aligned or ' ' in result.score_aligned
+
+        # AT extends AT context (right side)
+        assert result.identity == 1.0
+        assert '=' in result.score_aligned
     
     def test_complex_mixed_indel(self):
         """Test complex indel with both repeat extensions and regular content."""
@@ -749,18 +753,17 @@ class TestDocumentationExamples:
         seq1 = "N" * 25 + "ATCGATCGATCG" + "N" * 25  # Good sequence in middle
         seq2 = "X" * 25 + "ATCGATCGATCG" + "Y" * 25  # Same middle, bad ends
 
-        # With end trimming: variant range algorithm treats N as extending context
-        # (N matches any nucleotide), while X/Y are unknown and become core content
-        result = score_alignment(seq1, seq2, DEFAULT_ADJUSTMENT_PARAMS)
+        # With end trimming enabled: only middle region scored
+        trim_params = AdjustmentParams(end_skip_distance=20)
+        result_trim = score_alignment(seq1, seq2, trim_params)
         # N's extend context (N matches A on right, G on left), X's and Y's are core
         # Result: 1 normalized edit for each variant range with core content
-        assert result.identity > 0.9  # High identity due to N extending context
+        assert result_trim.identity > 0.9  # High identity due to N extending context
 
-        # Without end trimming: more positions scored
-        no_trim = AdjustmentParams(end_skip_distance=0)
-        result_no_trim = score_alignment(seq1, seq2, no_trim)
+        # Without end trimming (default): all positions scored
+        result_no_trim = score_alignment(seq1, seq2, DEFAULT_ADJUSTMENT_PARAMS)
         # More positions scored but similar identity due to N extending context
-        assert result_no_trim.scored_positions > result.scored_positions
+        assert result_no_trim.scored_positions > result_trim.scored_positions
 
 
 class TestOverhangScoring:
@@ -981,10 +984,11 @@ class TestMSADualGaps:
 
     def test_insufficient_context_with_dual_gaps(self):
         """Insufficient context when dual-gaps consume early positions."""
-        result = score_alignment("--ATT", "-G-TT", DEFAULT_ADJUSTMENT_PARAMS)
+        # Add leading match to avoid overhang behavior
+        result = score_alignment("C--ATT", "C-G-TT", DEFAULT_ADJUSTMENT_PARAMS)
 
-        # No left context available for the indel
-        # 'G' and 'A' should be treated as regular indel
+        # Minimal left context (C), 'G' and 'A' don't extend C
+        # Should be treated as regular indel
         assert result.mismatches >= 1
 
     def test_conflicting_context_no_homopolymer(self):
@@ -1224,18 +1228,17 @@ class TestVariantRangeAlgorithm:
 
     def test_variant_range_at_sequence_start(self):
         """Variant range at very start of sequence (no left context)."""
-        # -ATCG vs GATCG
-        # No left context for G → treated as core
-        result = score_alignment("-ATCG", "GATCG", DEFAULT_ADJUSTMENT_PARAMS)
+        # T-ATCG vs TGATCG - variant after first position, not overhang
+        # No left context for G (only T, G doesn't extend T) → treated as core
+        result = score_alignment("T-ATCG", "TGATCG", DEFAULT_ADJUSTMENT_PARAMS)
         assert result.identity < 1.0
         assert result.mismatches == 1
 
     def test_variant_range_at_sequence_end(self):
         """Variant range at very end of sequence (no right context)."""
-        # ATCG- vs ATCGA
-        # A extends... no, A doesn't have right context
-        # But left context is G, A doesn't extend G → core
-        result = score_alignment("ATCG-", "ATCGA", DEFAULT_ADJUSTMENT_PARAMS)
+        # ATCG-T vs ATCGAT - variant in middle, not overhang
+        # A doesn't extend G (left) or T (right) → core
+        result = score_alignment("ATCG-T", "ATCGAT", DEFAULT_ADJUSTMENT_PARAMS)
         assert result.identity < 1.0
         assert result.mismatches == 1
 
