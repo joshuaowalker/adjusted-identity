@@ -315,9 +315,12 @@ AlignmentResult(
     seq2_coverage=0.97,            # Fraction of seq2 in alignment
     seq1_aligned="ATCG-ATCG",      # Aligned sequence 1 with gaps
     seq2_aligned="ATCGATCG-",      # Aligned sequence 2 with gaps
-    score_aligned="||||=|||"      # Scoring visualization
+    score_aligned="||||=|||",      # Scoring visualization for seq1
+    score_aligned_seq2="||||=|||"  # Scoring visualization for seq2 (v0.2.1+)
 )
 ```
+
+**Note**: `score_aligned_seq2` was added in v0.2.1. See the [Migration Notes](#migration-notes-v021) section for details.
 
 ### Constants
 
@@ -568,6 +571,37 @@ Mycota Lab. https://mycotalab.substack.com/p/why-ncbi-blast-identity-scores-can
 BSD 2-Clause License - see [LICENSE](LICENSE) file for details.
 
 ## Changelog
+
+### Version 0.2.1
+
+- **New Feature**: Added `score_aligned_seq2` field to `AlignmentResult` for dual visualization
+- Each sequence now has its own scoring visualization string, enabling unambiguous display of how each position was scored
+- This addresses cases where alleles "float" within variant ranges due to homopolymer normalization
+- **Bug Fix**: Fixed dual-gap handling so they don't split variant ranges (key regression test added)
+- **Bug Fix**: Fixed visualization when one position is extension and other is core with matching cores
+- Improved visualization for indel normalization: first core position shows ` `, subsequent show `-`
+- 100% backward compatible - `score_aligned` continues to work as before
+
+#### Migration Notes (v0.2.1)
+
+**Dual Visualization Strings**: The `AlignmentResult` now includes `score_aligned_seq2` in addition to the existing `score_aligned` field:
+
+```python
+from adjusted_identity import align_and_score
+
+result = align_and_score("AAA-TTT", "AAAATTT")
+
+# Both visualization strings are now available
+print(f"Seq1 scoring: {result.score_aligned}")      # Visualization relative to seq1
+print(f"Seq2 scoring: {result.score_aligned_seq2}") # Visualization relative to seq2
+```
+
+**Why two strings?** When homopolymer normalization is enabled, allele content can "float" within variant ranges. A single visualization string cannot unambiguously show how each position was scored for both sequences. The dual strings resolve this ambiguity:
+
+- `score_aligned`: Shows scoring from seq1's perspective (extensions, core content, gaps)
+- `score_aligned_seq2`: Shows scoring from seq2's perspective
+
+**Backward Compatibility**: Existing code accessing `result.score_aligned` will continue to work unchanged. The new `score_aligned_seq2` field defaults to an empty string for any edge cases where it's not populated.
 
 ### Version 0.2.0
 - **Major Enhancement**: Implemented variant range algorithm for improved homopolymer and repeat motif detection

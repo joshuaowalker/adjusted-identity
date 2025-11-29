@@ -677,7 +677,10 @@ class TestEdgeCases:
         result = score_alignment("----", "----", DEFAULT_ADJUSTMENT_PARAMS)
         assert result.identity == 1.0  # No mismatches in all-gap alignment
         assert result.mismatches == 0
-        assert result.scored_positions == 4  # Gap characters are still scored as matches
+        # With new variant range algorithm, all-gap regions have no content to score
+        assert result.scored_positions == 0
+        # Visualization still shows match markers for dual-gaps
+        assert result.score_aligned == "||||"
     
     def test_unequal_length_sequences(self):
         """Aligned sequences of different lengths should raise error."""
@@ -936,9 +939,9 @@ class TestMSADualGaps:
         # THIS IS THE CASE THE VARIANT RANGE ALGORITHM WAS DESIGNED TO HANDLE!
         # Position 3: 'T' in seq2 (gap in seq1)
         # Position 4: 'C' in seq1 (gap in seq2)
-        # Position 5: dual-gap (counted as match)
+        # Position 5: dual-gap (part of variant range)
         #
-        # Variant range at positions 3-4:
+        # Variant range at positions 3-5:
         # - allele1="C", allele2="T"
         # - left_context="C" (position 2), right_context="T" (position 6)
         # - C extends C (left context) → pure extension
@@ -946,8 +949,9 @@ class TestMSADualGaps:
         # - Both are valid extensions in their respective directions → 0 edits
         assert result.identity == 1.0
         assert result.mismatches == 0
-        assert result.scored_positions == 6  # TGC + dual-gap + TC (variant not counted)
-        assert result.score_aligned == "|||==|||"  # == shows both extensions
+        # Scored positions: TGC (3) + variant range (0, both pure extensions) + TC (2) = 5
+        assert result.scored_positions == 5
+        assert result.score_aligned == "|||==|||"  # == shows both extensions, dual-gap as |
 
         # Test reversed - should be symmetric
         result_rev = score_alignment("TGCT--TC", "TGC-C-TC", DEFAULT_ADJUSTMENT_PARAMS)
@@ -969,10 +973,31 @@ class TestMSADualGaps:
         """Multiple consecutive dual-gaps in indel region."""
         result = score_alignment("A---TT", "A--GTT", DEFAULT_ADJUSTMENT_PARAMS)
 
-        # Positions 1-2 are dual-gaps (matched), position 3 has 'G'
-        # 'G' is not a homopolymer extension of 'T'
+        # Variant range includes positions 1-3 (dual-gaps and G)
+        # allele1="" (empty), allele2="G"
+        # G doesn't extend A (left) or T (right), so it's core content
+        # 1 edit (the G), normalized
         assert result.mismatches == 1
-        assert result.scored_positions == 6  # A + dual-gaps (2) + indel + TT
+        # Scored positions: A (1) + variant (1 normalized) + TT (2) = 4
+        assert result.scored_positions == 4
+
+    def test_dual_gaps_do_not_split_variant_range(self):
+        """Dual-gaps should NOT split variant ranges - they're part of the variant."""
+        # This is the key test case from the conversation that revealed the bug
+        # Variant range should be [5-10], not split by dual-gaps
+        result = score_alignment("CCTTTC---TTTTTTTTTTT", "CCTTT----C-TTTTTTTTT", DEFAULT_ADJUSTMENT_PARAMS)
+
+        # Variant range [5-10]:
+        # - allele1 = "CTT" (C at pos 5, TT at pos 9-10)
+        # - allele2 = "C" (C at pos 9)
+        # - TT are extensions of right T context
+        # - Both cores are "C" and match
+        # - Result: identity = 1.0
+        assert result.identity == 1.0
+        assert result.mismatches == 0
+        # Visualization shows: matches + core/gap + dual-gaps + matching cores + extension
+        assert result.score_aligned == "||||| ||||=|||||||||"
+        assert result.score_aligned_seq2 == "||||| ||||=|||||||||"
 
     def test_dual_gaps_in_context_region(self):
         """Dual-gaps in context region should be skipped when extracting context."""
