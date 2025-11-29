@@ -868,12 +868,33 @@ def _generate_variant_score_string(seq1_aligned, seq2_aligned, start, end,
         is_core1 = pos in seq1_core_positions
         is_core2 = pos in seq2_core_positions
 
-        if is_ext1 or is_ext2:
-            # Extension position - show as homopolymer extension if normalizing
+        # Determine if this is a "both nucleotides" position (substitution-like)
+        both_have_content = char1 != '-' and char2 != '-'
+
+        if both_have_content:
+            # Both sequences have nucleotides at this position
+            if is_core1 or is_core2:
+                # At least one is core content - this is a mismatch
+                score_chars.append(scoring_format.substitution)
+            elif is_ext1 or is_ext2:
+                # Both are extensions (or one is extension, other is not in allele)
+                if adjustment_params.normalize_homopolymers:
+                    score_chars.append(scoring_format.homopolymer_extension)
+                else:
+                    score_chars.append(scoring_format.indel_start)
+            else:
+                # Neither classified - shouldn't happen, but handle gracefully
+                is_match, is_ambig = _are_nucleotides_equivalent(
+                    char1, char2, adjustment_params.handle_iupac_overlap)
+                if is_match:
+                    score_chars.append(scoring_format.ambiguous_match if is_ambig else scoring_format.match)
+                else:
+                    score_chars.append(scoring_format.substitution)
+        elif is_ext1 or is_ext2:
+            # Single-sided with extension - show as homopolymer extension
             if adjustment_params.normalize_homopolymers:
                 score_chars.append(scoring_format.homopolymer_extension)
             else:
-                # Without normalization, show as indel
                 score_chars.append(scoring_format.indel_start)
         elif char1 == '-' or char2 == '-':
             # Indel in core region

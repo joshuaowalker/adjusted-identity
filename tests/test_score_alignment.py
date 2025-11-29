@@ -1119,6 +1119,8 @@ class TestVariantRangeAlgorithm:
         result = score_alignment("TGC-CX-TC", "TGCT---TC", DEFAULT_ADJUSTMENT_PARAMS)
         assert result.identity < 1.0
         assert result.mismatches == 1  # X core counts as 1 edit
+        # T(pos3)=extension, C(pos4)=extension, X(pos5)=core(space), dual-gap(pos6)=match
+        assert result.score_aligned == "|||== |||"
 
     def test_both_alleles_have_core_same_content(self):
         """Both alleles have core content that's identical."""
@@ -1288,3 +1290,41 @@ class TestVariantRangeAlgorithm:
         result = score_alignment("AAA-TTT", "AAAATTT", params)
         assert result.mismatches == 1  # 1 gap position
         assert result.scored_positions == 7  # All positions scored
+
+    # Score visualization tests - ensure correct markers for different scenarios
+
+    def test_score_visualization_both_pure_extensions(self):
+        """When both alleles are pure extensions, show '=' markers."""
+        # C extends C (left), T extends T (right) → both pure
+        result = score_alignment("TGC-C-TC", "TGCT--TC", DEFAULT_ADJUSTMENT_PARAMS)
+        assert result.score_aligned == "|||==|||"
+        assert result.mismatches == 0
+
+    def test_score_visualization_one_extension_one_core(self):
+        """When one allele extends and other has core, show substitution marker."""
+        # T extends T (right context), C doesn't extend → C is core
+        # The space at position 5 indicates the mismatch
+        result = score_alignment("TTG-ATT---T", "TTG-ACT---T", DEFAULT_ADJUSTMENT_PARAMS)
+        assert result.score_aligned == "||||| |||||"
+        assert result.mismatches == 1
+
+    def test_score_visualization_both_have_different_core(self):
+        """When both alleles have different core content, show substitution."""
+        # X doesn't extend A or G, Y doesn't extend A or G → both core, different
+        result = score_alignment("AAA-XGG", "AA-Y-GG", DEFAULT_ADJUSTMENT_PARAMS)
+        assert " " in result.score_aligned  # Substitution marker for core mismatch
+        assert result.mismatches == 1
+
+    def test_score_visualization_extension_vs_gap(self):
+        """Extension on one side, gap on other → show '=' for extension positions."""
+        # A extends A context, empty allele → pure extension
+        result = score_alignment("AAA-TTT", "AAAATTT", DEFAULT_ADJUSTMENT_PARAMS)
+        assert result.score_aligned == "|||=|||"
+        assert result.mismatches == 0
+
+    def test_score_visualization_core_indel(self):
+        """Core content that doesn't extend context → show indel marker."""
+        # X doesn't extend A or T → core content (indel)
+        result = score_alignment("AAA-TT", "AAAXTT", DEFAULT_ADJUSTMENT_PARAMS)
+        assert " " in result.score_aligned  # Core indel shows as space
+        assert result.mismatches == 1
