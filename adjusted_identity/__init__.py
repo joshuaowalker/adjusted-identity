@@ -891,9 +891,14 @@ def _generate_variant_score_strings(seq1_aligned, seq2_aligned, start, end,
             # If one is extension and other is core, show based on whether cores match
             if (is_ext1 and is_core2) or (is_ext2 and is_core1):
                 if cores_match:
-                    # Cores match - no mismatch counted
-                    score_chars_seq1.append(scoring_format.match)
-                    score_chars_seq2.append(scoring_format.match)
+                    # Cores match - asymmetric visualization:
+                    # extension side shows extension marker, core side shows match
+                    if is_ext1:
+                        score_chars_seq1.append(ext_marker)
+                        score_chars_seq2.append(scoring_format.match)
+                    else:
+                        score_chars_seq1.append(scoring_format.match)
+                        score_chars_seq2.append(ext_marker)
                 else:
                     # Cores differ - mismatch counted
                     score_chars_seq1.append(scoring_format.substitution)
@@ -924,16 +929,24 @@ def _generate_variant_score_strings(seq1_aligned, seq2_aligned, start, end,
                 score_chars_seq1.append(ext_marker)
                 score_chars_seq2.append(ext_marker)
             elif is_core2:
-                # seq2 is core - show indel markers (start for first, extension for rest)
-                if adjustment_params.normalize_indels and seen_core_start:
-                    # Subsequent core position - show as indel extension
-                    score_chars_seq1.append(scoring_format.indel_extension)
-                    score_chars_seq2.append(scoring_format.indel_extension)
+                # seq2 is core - check if cores match (only when HP normalization enabled)
+                if adjustment_params.normalize_homopolymers and cores_match:
+                    # Cores match - asymmetric visualization:
+                    # seq1 (gap) absorbs extension → show extension marker
+                    # seq2 (core) is the matching core → show match marker
+                    score_chars_seq1.append(ext_marker)
+                    score_chars_seq2.append(scoring_format.match)
                 else:
-                    # First core position - show as indel start
-                    score_chars_seq1.append(scoring_format.indel_start)
-                    score_chars_seq2.append(scoring_format.indel_start)
-                    seen_core_start = True
+                    # Cores differ or HP normalization disabled - show indel markers
+                    if adjustment_params.normalize_indels and seen_core_start:
+                        # Subsequent core position - show as indel extension
+                        score_chars_seq1.append(scoring_format.indel_extension)
+                        score_chars_seq2.append(scoring_format.indel_extension)
+                    else:
+                        # First core position - show as indel start
+                        score_chars_seq1.append(scoring_format.indel_start)
+                        score_chars_seq2.append(scoring_format.indel_start)
+                        seen_core_start = True
             else:
                 # Fallback (shouldn't happen)
                 score_chars_seq1.append(scoring_format.substitution)
@@ -951,16 +964,24 @@ def _generate_variant_score_strings(seq1_aligned, seq2_aligned, start, end,
                 score_chars_seq1.append(ext_marker)
                 score_chars_seq2.append(ext_marker)
             elif is_core1:
-                # seq1 is core - show indel markers (start for first, extension for rest)
-                if adjustment_params.normalize_indels and seen_core_start:
-                    # Subsequent core position - show as indel extension
-                    score_chars_seq1.append(scoring_format.indel_extension)
-                    score_chars_seq2.append(scoring_format.indel_extension)
+                # seq1 is core - check if cores match (only when HP normalization enabled)
+                if adjustment_params.normalize_homopolymers and cores_match:
+                    # Cores match - asymmetric visualization:
+                    # seq1 (core) is the matching core → show match marker
+                    # seq2 (gap) absorbs extension → show extension marker
+                    score_chars_seq1.append(scoring_format.match)
+                    score_chars_seq2.append(ext_marker)
                 else:
-                    # First core position - show as indel start
-                    score_chars_seq1.append(scoring_format.indel_start)
-                    score_chars_seq2.append(scoring_format.indel_start)
-                    seen_core_start = True
+                    # Cores differ or HP normalization disabled - show indel markers
+                    if adjustment_params.normalize_indels and seen_core_start:
+                        # Subsequent core position - show as indel extension
+                        score_chars_seq1.append(scoring_format.indel_extension)
+                        score_chars_seq2.append(scoring_format.indel_extension)
+                    else:
+                        # First core position - show as indel start
+                        score_chars_seq1.append(scoring_format.indel_start)
+                        score_chars_seq2.append(scoring_format.indel_start)
+                        seen_core_start = True
             else:
                 # Fallback (shouldn't happen)
                 score_chars_seq1.append(scoring_format.substitution)

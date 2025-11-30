@@ -995,9 +995,46 @@ class TestMSADualGaps:
         # - Result: identity = 1.0
         assert result.identity == 1.0
         assert result.mismatches == 0
-        # Visualization shows: matches + core/gap + dual-gaps + matching cores + extension
-        assert result.score_aligned == "||||| ||||=|||||||||"
-        assert result.score_aligned_seq2 == "||||| ||||=|||||||||"
+        # Visualization: each string has same count of = markers (2 for 2 HP extensions)
+        # score_aligned: core at pos 5 shows |, extensions at 9-10 show ==
+        # score_aligned_seq2: gap at pos 5 absorbs = marker, core at 9 shows |, gap at 10 shows =
+        assert result.score_aligned == "|||||||||==|||||||||"
+        assert result.score_aligned_seq2 == "|||||=||||=|||||||||"
+
+    def test_floating_nucleotide_between_homopolymer_runs(self):
+        """Floating nucleotide between HP runs should show = markers, not space.
+
+        This is a real-world case from ONT fungal barcoding data where a single C
+        'floats' between a C-run and T-run. The C can extend either run, so both
+        positions are valid and should show = markers (not space which indicates error).
+
+        Bug report: score_aligned showed ' ' at position 11 even though mismatches=0,
+        making it impossible for downstream code to distinguish from real errors.
+        """
+        read =      "TGTCACCCTTT----CTTTTTTTTTTTT"
+        consensus = "TGTCACCCTTTC---TTTTTTTTTTTTT"
+
+        params = AdjustmentParams(
+            normalize_homopolymers=True,
+            handle_iupac_overlap=False,
+            normalize_indels=True,
+            end_skip_distance=0,
+            max_repeat_motif_length=1
+        )
+
+        result = score_alignment(read, consensus, params)
+
+        assert result.identity == 1.0
+        assert result.mismatches == 0
+        # Both scoring strings should have same count of = markers
+        assert result.score_aligned.count('=') == result.score_aligned_seq2.count('=')
+        # Position 11 (gap in read, C core in consensus) should show = not space
+        assert result.score_aligned[11] == '='
+        # Position 15 (C core in read, T extension in consensus) should show | for read
+        assert result.score_aligned[15] == '|'
+        # Verify no spaces in scoring strings (no errors counted)
+        assert ' ' not in result.score_aligned
+        assert ' ' not in result.score_aligned_seq2
 
     def test_dual_gaps_in_context_region(self):
         """Dual-gaps in context region should be skipped when extracting context."""
