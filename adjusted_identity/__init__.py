@@ -389,14 +389,15 @@ def _find_scoring_region(seq1_aligned, seq2_aligned, end_skip_distance):
 
 def _extract_left_context(seq1_aligned, seq2_aligned, position, length):
     """
-    Extract up to 'length' nucleotide characters from positions before 'position',
-    working backwards, enforcing consensus between sequences for MSA support.
+    Extract up to 'length' nucleotide characters from match positions before 'position'.
 
-    Context extraction rules (MSA-compatible):
-    - Both sequences agree (same non-gap char) → use it (valid consensus)
-    - One has gap, other has char → use the character (unambiguous)
-    - Both have gaps (dual-gap) → skip position entirely
-    - Both have different non-gap chars → conflict, return None (no consensus)
+    Context is only valid from positions where both sequences agree (match positions).
+    Since seq1 == seq2 at match positions, we read from seq1 and verify agreement.
+
+    Rules:
+    - Match (seq1 == seq2, non-gap) → use the character
+    - Dual-gap (both '-') → skip (not a match, but not a conflict)
+    - Any other case (gap or mismatch) → hit another variant range, return None
 
     Args:
         seq1_aligned, seq2_aligned: Aligned sequences with gaps
@@ -406,62 +407,54 @@ def _extract_left_context(seq1_aligned, seq2_aligned, position, length):
     Returns:
         str: Context string in left-to-right order (e.g., "AAA"), or None if:
             - Insufficient context available (fewer than 'length' chars)
-            - Sequences disagree at context position (conflicting characters)
+            - Hit another variant range (non-match position)
 
     Examples:
         >>> _extract_left_context("AGG-AC", "AG-GAC", 2, 1)
-        'G'  # Both sequences agree at position 1
+        'G'  # Position 1 is a match
         >>> _extract_left_context("AGT-AC", "AX-GAC", 2, 1)
-        None  # Sequences disagree at position 1 (G vs X)
+        None  # Position 1 is not a match (G vs X)
     """
     context_chars = []
     pos = position - 1
-    collected = 0  # Track count without calling len() in loop
+    collected = 0
 
     while collected < length and pos >= 0:
         char1 = seq1_aligned[pos]
         char2 = seq2_aligned[pos]
 
-        # Skip dual-gap positions (common in MSA-derived alignments)
+        # Dual-gap: skip (not a match position, but doesn't end context search)
         if char1 == '-' and char2 == '-':
             pos -= 1
             continue
 
-        # Both sequences have content - they must AGREE for valid consensus
-        if char1 != '-' and char2 != '-':
-            # Fast path: exact match (most common), then case-insensitive
-            if char1 == char2 or char1.upper() == char2.upper():
-                context_chars.append(char1)
-                collected += 1
-            else:
-                # Disagreement = no clear consensus context
-                # Cannot reliably detect homopolymer extension
-                return None
-        else:
-            # One has gap, other has character - use the non-gap character
-            context_chars.append(char1 if char1 != '-' else char2)
+        # Check for match: must be non-gap and equal (case-insensitive)
+        if char1 != '-' and char2 != '-' and (char1 == char2 or char1.upper() == char2.upper()):
+            context_chars.append(char1)
             collected += 1
+            pos -= 1
+            continue
 
-        pos -= 1
+        # Any other case: we've hit a variant range (gap or mismatch)
+        return None
 
-    # Check if we collected enough context characters
     if collected < length:
-        return None  # Insufficient context available
+        return None
 
-    # Reverse to get left-to-right order
     return ''.join(reversed(context_chars))
 
 
 def _extract_right_context(seq1_aligned, seq2_aligned, position, length):
     """
-    Extract up to 'length' nucleotide characters from positions after 'position',
-    working forwards, enforcing consensus between sequences for MSA support.
+    Extract up to 'length' nucleotide characters from match positions after 'position'.
 
-    Context extraction rules (MSA-compatible):
-    - Both sequences agree (same non-gap char) → use it (valid consensus)
-    - One has gap, other has char → use the character (unambiguous)
-    - Both have gaps (dual-gap) → skip position entirely
-    - Both have different non-gap chars → conflict, return None (no consensus)
+    Context is only valid from positions where both sequences agree (match positions).
+    Since seq1 == seq2 at match positions, we read from seq1 and verify agreement.
+
+    Rules:
+    - Match (seq1 == seq2, non-gap) → use the character
+    - Dual-gap (both '-') → skip (not a match, but not a conflict)
+    - Any other case (gap or mismatch) → hit another variant range, return None
 
     Args:
         seq1_aligned, seq2_aligned: Aligned sequences with gaps
@@ -471,48 +464,40 @@ def _extract_right_context(seq1_aligned, seq2_aligned, position, length):
     Returns:
         str: Context string in left-to-right order (e.g., "TTT"), or None if:
             - Insufficient context available (fewer than 'length' chars)
-            - Sequences disagree at context position (conflicting characters)
+            - Hit another variant range (non-match position)
 
     Examples:
         >>> _extract_right_context("AGA--TT", "AGAT-TT", 4, 2)
-        'TT'  # Both sequences agree at positions 5-6
+        'TT'  # Positions 5-6 are matches
         >>> _extract_right_context("AGA--TC", "AGAT-TG", 4, 2)
-        None  # Sequences disagree at position 6 (C vs G)
+        None  # Position 6 is not a match (C vs G)
     """
     context_chars = []
     pos = position + 1
     max_pos = len(seq1_aligned)
-    collected = 0  # Track count without calling len() in loop
+    collected = 0
 
     while collected < length and pos < max_pos:
         char1 = seq1_aligned[pos]
         char2 = seq2_aligned[pos]
 
-        # Skip dual-gap positions (common in MSA-derived alignments)
+        # Dual-gap: skip (not a match position, but doesn't end context search)
         if char1 == '-' and char2 == '-':
             pos += 1
             continue
 
-        # Both sequences have content - they must AGREE for valid consensus
-        if char1 != '-' and char2 != '-':
-            # Fast path: exact match (most common), then case-insensitive
-            if char1 == char2 or char1.upper() == char2.upper():
-                context_chars.append(char1)
-                collected += 1
-            else:
-                # Disagreement = no clear consensus context
-                # Cannot reliably detect homopolymer extension
-                return None
-        else:
-            # One has gap, other has character - use the non-gap character
-            context_chars.append(char1 if char1 != '-' else char2)
+        # Check for match: must be non-gap and equal (case-insensitive)
+        if char1 != '-' and char2 != '-' and (char1 == char2 or char1.upper() == char2.upper()):
+            context_chars.append(char1)
             collected += 1
+            pos += 1
+            continue
 
-        pos += 1
+        # Any other case: we've hit a variant range (gap or mismatch)
+        return None
 
-    # Check if we collected enough context characters
     if collected < length:
-        return None  # Insufficient context available
+        return None
 
     return ''.join(context_chars)
 
