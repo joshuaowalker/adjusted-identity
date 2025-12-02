@@ -201,35 +201,50 @@ IUPAC_CODES = {
 }
 
 
+# Fast lookup sets for common cases (avoid repeated set creation)
+_STANDARD_NUCS = {'A', 'T', 'C', 'G', 'a', 't', 'c', 'g'}
+_STANDARD_NUCS_AND_GAP = {'A', 'T', 'C', 'G', 'a', 't', 'c', 'g', '-'}
+
+
 def _are_nucleotides_equivalent(nuc1, nuc2, enable_iupac_intersection=True):
     """
     Check if two nucleotides are equivalent according to IUPAC ambiguity codes.
-    
+
     Args:
         nuc1 (str): First nucleotide (single character)
         nuc2 (str): Second nucleotide (single character)
         enable_iupac_intersection (bool): Allow different ambiguity codes to match via intersection
-        
+
     Returns:
         tuple: (is_match, is_ambiguous) where:
             - is_match: True if nucleotides are equivalent
             - is_ambiguous: True if match involves ambiguity codes (not exact A=A, C=C, G=G, T=T)
     """
-    # Convert to uppercase
-    nuc1 = nuc1.upper()
-    nuc2 = nuc2.upper()
-    
-    # Check for exact match first (including gap characters)
+    # Fast path: exact match (case-sensitive) - most common case
     if nuc1 == nuc2:
-        # Exact match - check if it's one of the standard nucleotides or a gap
-        # Gaps matching are treated as non-ambiguous matches (MSA support)
-        is_standard_or_gap = nuc1 in {'A', 'T', 'C', 'G', '-'}
+        return (True, nuc1 not in _STANDARD_NUCS_AND_GAP)
+
+    # Fast path: case-insensitive match for standard nucleotides
+    if nuc1 in _STANDARD_NUCS and nuc2 in _STANDARD_NUCS:
+        # Both are standard nucleotides - check case-insensitive match
+        if nuc1.upper() == nuc2.upper():
+            return (True, False)
+        else:
+            return (False, False)
+
+    # Slow path: handle IUPAC codes - convert to uppercase
+    nuc1_upper = nuc1.upper()
+    nuc2_upper = nuc2.upper()
+
+    # Check for exact match after uppercasing
+    if nuc1_upper == nuc2_upper:
+        is_standard_or_gap = nuc1_upper in {'A', 'T', 'C', 'G', '-'}
         return (True, not is_standard_or_gap)
-    
+
     # Get possible nucleotides for each code
-    possible1 = IUPAC_CODES.get(nuc1, {nuc1})
-    possible2 = IUPAC_CODES.get(nuc2, {nuc2})
-    
+    possible1 = IUPAC_CODES.get(nuc1_upper, {nuc1_upper})
+    possible2 = IUPAC_CODES.get(nuc2_upper, {nuc2_upper})
+
     # Check if there's any overlap
     has_overlap = bool(possible1 & possible2)
     both_codes_sets = len(possible1) > 1 and len(possible2) > 1
@@ -402,8 +417,9 @@ def _extract_left_context(seq1_aligned, seq2_aligned, position, length):
     """
     context_chars = []
     pos = position - 1
+    collected = 0  # Track count without calling len() in loop
 
-    while len(context_chars) < length and pos >= 0:
+    while collected < length and pos >= 0:
         char1 = seq1_aligned[pos]
         char2 = seq2_aligned[pos]
 
@@ -414,8 +430,10 @@ def _extract_left_context(seq1_aligned, seq2_aligned, position, length):
 
         # Both sequences have content - they must AGREE for valid consensus
         if char1 != '-' and char2 != '-':
-            if char1.upper() == char2.upper():
+            # Fast path: exact match (most common), then case-insensitive
+            if char1 == char2 or char1.upper() == char2.upper():
                 context_chars.append(char1)
+                collected += 1
             else:
                 # Disagreement = no clear consensus context
                 # Cannot reliably detect homopolymer extension
@@ -423,11 +441,12 @@ def _extract_left_context(seq1_aligned, seq2_aligned, position, length):
         else:
             # One has gap, other has character - use the non-gap character
             context_chars.append(char1 if char1 != '-' else char2)
+            collected += 1
 
         pos -= 1
 
     # Check if we collected enough context characters
-    if len(context_chars) < length:
+    if collected < length:
         return None  # Insufficient context available
 
     # Reverse to get left-to-right order
@@ -464,8 +483,9 @@ def _extract_right_context(seq1_aligned, seq2_aligned, position, length):
     context_chars = []
     pos = position + 1
     max_pos = len(seq1_aligned)
+    collected = 0  # Track count without calling len() in loop
 
-    while len(context_chars) < length and pos < max_pos:
+    while collected < length and pos < max_pos:
         char1 = seq1_aligned[pos]
         char2 = seq2_aligned[pos]
 
@@ -476,8 +496,10 @@ def _extract_right_context(seq1_aligned, seq2_aligned, position, length):
 
         # Both sequences have content - they must AGREE for valid consensus
         if char1 != '-' and char2 != '-':
-            if char1.upper() == char2.upper():
+            # Fast path: exact match (most common), then case-insensitive
+            if char1 == char2 or char1.upper() == char2.upper():
                 context_chars.append(char1)
+                collected += 1
             else:
                 # Disagreement = no clear consensus context
                 # Cannot reliably detect homopolymer extension
@@ -485,11 +507,12 @@ def _extract_right_context(seq1_aligned, seq2_aligned, position, length):
         else:
             # One has gap, other has character - use the non-gap character
             context_chars.append(char1 if char1 != '-' else char2)
+            collected += 1
 
         pos += 1
 
     # Check if we collected enough context characters
-    if len(context_chars) < length:
+    if collected < length:
         return None  # Insufficient context available
 
     return ''.join(context_chars)
@@ -561,8 +584,7 @@ def _analyze_allele(allele, left_context, right_context, max_motif_length, handl
     if not allele:
         return AlleleAnalysis(0, 0, '', True)  # Empty allele = pure extension
 
-    chars = list(allele)
-    n = len(chars)
+    n = len(allele)
     left_consumed = 0
     right_consumed = 0
 
@@ -572,15 +594,19 @@ def _analyze_allele(allele, left_context, right_context, max_motif_length, handl
             motif = left_context[-motif_len:]  # Last motif_len chars of left context
 
             # Check for degenerate case (homopolymer disguised as longer motif)
-            if len(set(motif.upper())) == 1:
-                motif = motif[0]
-                motif_len = 1
+            # Fast check: compare first and last char instead of building a set
+            if motif_len > 1 and motif[0].upper() == motif[-1].upper():
+                # Check all chars are same
+                first_upper = motif[0].upper()
+                if all(c.upper() == first_upper for c in motif):
+                    motif = motif[0]
+                    motif_len = 1
 
-            # Count complete motif matches from left
+            # Count complete motif matches from left (use string slicing, not list)
             consumed = 0
             pos = 0
             while pos + motif_len <= n:
-                chunk = ''.join(chars[pos:pos + motif_len])
+                chunk = allele[pos:pos + motif_len]
                 if _motif_matches(chunk, motif, handle_iupac):
                     consumed += motif_len
                     pos += motif_len
@@ -594,22 +620,29 @@ def _analyze_allele(allele, left_context, right_context, max_motif_length, handl
     # RIGHT EXTENSION: Try different motif lengths (largest first)
     if right_context:
         remaining_start = left_consumed
-        remaining_chars = chars[remaining_start:]
+        remaining_len = n - remaining_start
 
         for motif_len in range(min(max_motif_length, len(right_context)), 0, -1):
             motif = right_context[:motif_len]  # First motif_len chars of right context
 
-            # Check for degenerate case
-            if len(set(motif.upper())) == 1:
-                motif = motif[0]
-                motif_len = 1
+            # Check for degenerate case (homopolymer disguised as longer motif)
+            # Fast check: compare first and last char instead of building a set
+            if motif_len > 1 and motif[0].upper() == motif[-1].upper():
+                # Check all chars are same
+                first_upper = motif[0].upper()
+                if all(c.upper() == first_upper for c in motif):
+                    motif = motif[0]
+                    motif_len = 1
 
-            # Count complete motif matches from right
+            # Count complete motif matches from right (use string slicing, not list)
             consumed = 0
-            pos = len(remaining_chars)
+            pos = remaining_len
 
             while pos >= motif_len:
-                chunk = ''.join(remaining_chars[pos - motif_len:pos])
+                # Slice from the remaining portion of allele
+                chunk_start = remaining_start + pos - motif_len
+                chunk_end = remaining_start + pos
+                chunk = allele[chunk_start:chunk_end]
                 if _motif_matches(chunk, motif, handle_iupac):
                     consumed += motif_len
                     pos -= motif_len
@@ -620,10 +653,10 @@ def _analyze_allele(allele, left_context, right_context, max_motif_length, handl
                 right_consumed = consumed
                 break
 
-    # Core content is what remains
+    # Core content is what remains (string slicing, no list conversion)
     core_start = left_consumed
     core_end = n - right_consumed
-    core_content = ''.join(chars[core_start:core_end]) if core_end > core_start else ''
+    core_content = allele[core_start:core_end] if core_end > core_start else ''
 
     return AlleleAnalysis(
         left_extension_count=left_consumed,
@@ -653,22 +686,18 @@ def _find_variant_ranges(seq1_aligned, seq2_aligned, scoring_start, scoring_end,
     variant_ranges = []
     i = scoring_start
 
-    def is_match_position(pos):
-        """Check if position is a match for variant range boundary detection.
-
-        Only non-gap matches count as boundaries. Dual-gaps are NOT matches
-        because they should be included within variant ranges, not split them.
-        """
-        c1, c2 = seq1_aligned[pos], seq2_aligned[pos]
-        # Both must be non-gap and equivalent to be a match
-        if c1 != '-' and c2 != '-':
-            is_match, _ = _are_nucleotides_equivalent(c1, c2, handle_iupac)
-            return is_match
-        # Any gap (single-sided or dual) is not a match for boundary purposes
-        return False
-
+    # Inline match checking for performance - avoid function call overhead
     while i <= scoring_end:
-        if is_match_position(i):
+        c1, c2 = seq1_aligned[i], seq2_aligned[i]
+        # Fast path: exact match of non-gap characters (most common case)
+        if c1 == c2 and c1 != '-':
+            i += 1
+            continue
+        # Check for gap - any gap means not a match
+        if c1 == '-' or c2 == '-':
+            pass  # Not a match, fall through to variant range handling
+        # Slow path: check IUPAC equivalence for different characters
+        elif _are_nucleotides_equivalent(c1, c2, handle_iupac)[0]:
             i += 1
             continue
 
@@ -677,9 +706,19 @@ def _find_variant_ranges(seq1_aligned, seq2_aligned, scoring_start, scoring_end,
         # Left bound is the position just before variant start (if within scoring region)
         left_bound_pos = i - 1 if i > scoring_start else -1
 
-        # Scan to find end of variant range
+        # Scan to find end of variant range (inline match check for performance)
+        i += 1
         while i <= scoring_end:
-            if is_match_position(i):
+            c1, c2 = seq1_aligned[i], seq2_aligned[i]
+            # Fast path: exact match of non-gap characters
+            if c1 == c2 and c1 != '-':
+                break
+            # Gap means not a match - continue in variant range
+            if c1 == '-' or c2 == '-':
+                i += 1
+                continue
+            # Slow path: check IUPAC equivalence
+            if _are_nucleotides_equivalent(c1, c2, handle_iupac)[0]:
                 break
             i += 1
 
@@ -1100,12 +1139,7 @@ def score_alignment(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_
         seq1_aligned, seq2_aligned, scoring_start, scoring_end,
         adjustment_params.handle_iupac_overlap
     )
-
-    # Build a set of positions that are in variant ranges for quick lookup
-    variant_positions = set()
-    for vr_start, vr_end, _, _ in variant_ranges:
-        for pos in range(vr_start, vr_end + 1):
-            variant_positions.add(pos)
+    num_variant_ranges = len(variant_ranges)  # Cache length
 
     # Process each position in the scoring region
     pos = scoring_start
@@ -1113,7 +1147,7 @@ def score_alignment(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_
 
     while pos <= scoring_end:
         # Check if this position starts a variant range
-        if vr_index < len(variant_ranges) and pos == variant_ranges[vr_index][0]:
+        if vr_index < num_variant_ranges and pos == variant_ranges[vr_index][0]:
             vr_start, vr_end, left_bound, right_bound = variant_ranges[vr_index]
 
             # Extract alleles from both sequences
