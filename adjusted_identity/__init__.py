@@ -84,8 +84,7 @@ class AlignmentResult:
         seq2_coverage: Fraction of seq2 covered by alignment (0.0-1.0)
         seq1_aligned: Aligned sequence 1 with gap characters
         seq2_aligned: Aligned sequence 2 with gap characters
-        score_aligned: Scoring visualization for seq1 (kept for backwards compatibility)
-        score_aligned_seq2: Scoring visualization for seq2
+        score_aligned: Scoring visualization string
     """
     identity: float
     mismatches: int
@@ -95,7 +94,6 @@ class AlignmentResult:
     seq1_aligned: str
     seq2_aligned: str
     score_aligned: str
-    score_aligned_seq2: str = ""  # Default empty for backwards compatibility
     
 
 
@@ -103,12 +101,13 @@ class AlignmentResult:
 class ScoringFormat:
     """Format codes for alignment scoring visualization."""
     match: str = '|'                    # Exact match (A=A, C=C, G=G, T=T)
-    ambiguous_match: str = '='          # Ambiguous nucleotide match (any IUPAC code match)
+    ambiguous_match: str = '='          # Ambiguous nucleotide match (different IUPAC codes with intersection)
     substitution: str = ' '             # Nucleotide substitution
     indel_start: str = ' '              # First position of indel (scored)
     indel_extension: str = '-'          # Indel positions skipped due to normalization
     homopolymer_extension: str = '='    # Homopolymer length difference
     end_trimmed: str = '.'              # Position outside scoring region (end trimmed)
+    dual_gap: str = '.'                 # Both sequences have gap (MSA artifact, not scored)
     
     def __post_init__(self):
         """Validate that all scoring codes are single characters."""
@@ -853,17 +852,16 @@ def _score_variant_range(allele1, analysis1, allele2, analysis2, adjustment_para
     }
 
 
-def _generate_variant_score_strings(seq1_aligned, seq2_aligned, start, end,
-                                     analysis1, analysis2, allele1_positions, allele2_positions,
-                                     scoring_format, adjustment_params):
+def _generate_variant_score_string(seq1_aligned, seq2_aligned, start, end,
+                                    analysis1, analysis2, allele1_positions, allele2_positions,
+                                    scoring_format, adjustment_params):
     """
-    Generate score_aligned strings for both sequences in a variant range.
+    Generate score_aligned string for a variant range.
 
-    Each sequence gets its own visualization string. The visualization reflects
-    how positions were scored:
+    The visualization reflects how positions were scored:
     - Extension positions show extension marker (=)
     - Core positions show match (|) if cores match, mismatch ( ) if they differ
-    - Gap positions mirror the other sequence's marker (borrowing for extensions)
+    - Gap positions show extension marker if the other sequence is an extension
 
     Args:
         seq1_aligned, seq2_aligned: Aligned sequences
@@ -874,7 +872,7 @@ def _generate_variant_score_strings(seq1_aligned, seq2_aligned, start, end,
         adjustment_params: AdjustmentParams for scoring behavior
 
     Returns:
-        tuple: (score_string_seq1, score_string_seq2)
+        str: Score visualization string for this variant range
     """
     # Build position classification sets for seq1
     seq1_left_ext_positions = set(allele1_positions[:analysis1.left_extension_count])
@@ -904,19 +902,17 @@ def _generate_variant_score_strings(seq1_aligned, seq2_aligned, start, end,
     ext_marker = (scoring_format.homopolymer_extension if adjustment_params.normalize_homopolymers
                   else scoring_format.indel_extension)
 
-    # Generate visualization for each sequence
-    score_chars_seq1 = []
-    score_chars_seq2 = []
+    # Generate visualization
+    score_chars = []
     seen_core_start = False  # Track if we've seen the first core position (for indel normalization)
 
     for pos in range(start, end + 1):
         char1 = seq1_aligned[pos]
         char2 = seq2_aligned[pos]
 
-        # Case 1: Dual-gap - both show match
+        # Case 1: Dual-gap - both sequences have gap (MSA artifact, not scored)
         if char1 == '-' and char2 == '-':
-            score_chars_seq1.append(scoring_format.match)
-            score_chars_seq2.append(scoring_format.match)
+            score_chars.append(scoring_format.dual_gap)
             continue
 
         # Case 2: Both have content
@@ -930,31 +926,20 @@ def _generate_variant_score_strings(seq1_aligned, seq2_aligned, start, end,
             # If one is extension and other is core, show based on whether cores match
             if (is_ext1 and is_core2) or (is_ext2 and is_core1):
                 if cores_match:
-                    # Cores match - asymmetric visualization:
-                    # extension side shows extension marker, core side shows match
-                    if is_ext1:
-                        score_chars_seq1.append(ext_marker)
-                        score_chars_seq2.append(scoring_format.match)
-                    else:
-                        score_chars_seq1.append(scoring_format.match)
-                        score_chars_seq2.append(ext_marker)
+                    # Cores match - show extension marker for seq1's extension, match for seq1's core
+                    score_chars.append(ext_marker if is_ext1 else scoring_format.match)
                 else:
                     # Cores differ - mismatch counted
-                    score_chars_seq1.append(scoring_format.substitution)
-                    score_chars_seq2.append(scoring_format.substitution)
+                    score_chars.append(scoring_format.substitution)
             elif is_ext1 and is_ext2:
                 # Both extensions - show extension marker
-                score_chars_seq1.append(ext_marker)
-                score_chars_seq2.append(ext_marker)
+                score_chars.append(ext_marker)
             elif is_core1 and is_core2:
                 # Both core - show match or mismatch based on core comparison
-                marker = scoring_format.match if cores_match else scoring_format.substitution
-                score_chars_seq1.append(marker)
-                score_chars_seq2.append(marker)
+                score_chars.append(scoring_format.match if cores_match else scoring_format.substitution)
             else:
                 # Fallback (shouldn't happen normally)
-                score_chars_seq1.append(scoring_format.substitution)
-                score_chars_seq2.append(scoring_format.substitution)
+                score_chars.append(scoring_format.substitution)
             continue
 
         # Case 3: seq1 has gap, seq2 has content
@@ -965,31 +950,22 @@ def _generate_variant_score_strings(seq1_aligned, seq2_aligned, start, end,
 
             if is_ext2:
                 # seq2 is extension - seq1 borrows extension marker
-                score_chars_seq1.append(ext_marker)
-                score_chars_seq2.append(ext_marker)
+                score_chars.append(ext_marker)
             elif is_core2:
                 # seq2 is core - check if cores match (only when HP normalization enabled)
                 if adjustment_params.normalize_homopolymers and cores_match:
-                    # Cores match - asymmetric visualization:
-                    # seq1 (gap) absorbs extension → show extension marker
-                    # seq2 (core) is the matching core → show match marker
-                    score_chars_seq1.append(ext_marker)
-                    score_chars_seq2.append(scoring_format.match)
+                    # Cores match - seq1 (gap) absorbs extension → show extension marker
+                    score_chars.append(ext_marker)
                 else:
                     # Cores differ or HP normalization disabled - show indel markers
                     if adjustment_params.normalize_indels and seen_core_start:
-                        # Subsequent core position - show as indel extension
-                        score_chars_seq1.append(scoring_format.indel_extension)
-                        score_chars_seq2.append(scoring_format.indel_extension)
+                        score_chars.append(scoring_format.indel_extension)
                     else:
-                        # First core position - show as indel start
-                        score_chars_seq1.append(scoring_format.indel_start)
-                        score_chars_seq2.append(scoring_format.indel_start)
+                        score_chars.append(scoring_format.indel_start)
                         seen_core_start = True
             else:
                 # Fallback (shouldn't happen)
-                score_chars_seq1.append(scoring_format.substitution)
-                score_chars_seq2.append(scoring_format.substitution)
+                score_chars.append(scoring_format.substitution)
             continue
 
         # Case 4: seq1 has content, seq2 has gap
@@ -999,35 +975,26 @@ def _generate_variant_score_strings(seq1_aligned, seq2_aligned, start, end,
             is_core1 = pos in seq1_core_positions or not adjustment_params.normalize_homopolymers
 
             if is_ext1:
-                # seq1 is extension - seq2 borrows extension marker
-                score_chars_seq1.append(ext_marker)
-                score_chars_seq2.append(ext_marker)
+                # seq1 is extension
+                score_chars.append(ext_marker)
             elif is_core1:
                 # seq1 is core - check if cores match (only when HP normalization enabled)
                 if adjustment_params.normalize_homopolymers and cores_match:
-                    # Cores match - asymmetric visualization:
-                    # seq1 (core) is the matching core → show match marker
-                    # seq2 (gap) absorbs extension → show extension marker
-                    score_chars_seq1.append(scoring_format.match)
-                    score_chars_seq2.append(ext_marker)
+                    # Cores match - seq1 (core) is the matching core → show match marker
+                    score_chars.append(scoring_format.match)
                 else:
                     # Cores differ or HP normalization disabled - show indel markers
                     if adjustment_params.normalize_indels and seen_core_start:
-                        # Subsequent core position - show as indel extension
-                        score_chars_seq1.append(scoring_format.indel_extension)
-                        score_chars_seq2.append(scoring_format.indel_extension)
+                        score_chars.append(scoring_format.indel_extension)
                     else:
-                        # First core position - show as indel start
-                        score_chars_seq1.append(scoring_format.indel_start)
-                        score_chars_seq2.append(scoring_format.indel_start)
+                        score_chars.append(scoring_format.indel_start)
                         seen_core_start = True
             else:
                 # Fallback (shouldn't happen)
-                score_chars_seq1.append(scoring_format.substitution)
-                score_chars_seq2.append(scoring_format.substitution)
+                score_chars.append(scoring_format.substitution)
             continue
 
-    return ''.join(score_chars_seq1), ''.join(score_chars_seq2)
+    return ''.join(score_chars)
 
 
 def score_alignment(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_format=None):
@@ -1114,7 +1081,6 @@ def score_alignment(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_
 
     # Always build alignment scoring codes for visualization
     score_aligned_seq1 = []
-    score_aligned_seq2 = []
 
     # Find the scoring region boundaries (end trimming controlled by end_skip_distance)
     scoring_start, scoring_end = _find_scoring_region(
@@ -1132,7 +1098,6 @@ def score_alignment(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_
     # Add end-trimmed markers for positions before scoring region
     for i in range(scoring_start):
         score_aligned_seq1.append(scoring_format.end_trimmed)
-        score_aligned_seq2.append(scoring_format.end_trimmed)
 
     # Find all variant ranges within the scoring region
     variant_ranges = _find_variant_ranges(
@@ -1194,14 +1159,13 @@ def score_alignment(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_
             edits += vr_score['edits']
             scored_positions += vr_score['scored_positions']
 
-            # Generate score strings for this variant range (one for each sequence)
-            vr_score_seq1, vr_score_seq2 = _generate_variant_score_strings(
+            # Generate score string for this variant range
+            vr_score_str = _generate_variant_score_string(
                 seq1_aligned, seq2_aligned, vr_start, vr_end,
                 analysis1, analysis2, allele1_positions, allele2_positions,
                 scoring_format, adjustment_params
             )
-            score_aligned_seq1.append(vr_score_seq1)
-            score_aligned_seq2.append(vr_score_seq2)
+            score_aligned_seq1.append(vr_score_str)
 
             # Move past this variant range
             pos = vr_end + 1
@@ -1211,11 +1175,10 @@ def score_alignment(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_
             # This is a match position (both non-gap and equivalent, or dual-gap)
             char1, char2 = seq1_aligned[pos], seq2_aligned[pos]
 
-            # Check for dual-gap (treated as match)
+            # Check for dual-gap (MSA artifact - not scored, just visualized)
             if char1 == '-' and char2 == '-':
-                scored_positions += 1
-                score_aligned_seq1.append(scoring_format.match)
-                score_aligned_seq2.append(scoring_format.match)
+                # Dual-gaps are NOT counted in scored_positions
+                score_aligned_seq1.append(scoring_format.dual_gap)
                 pos += 1
                 continue
 
@@ -1225,16 +1188,13 @@ def score_alignment(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_
             scored_positions += 1
             if is_ambiguous:
                 score_aligned_seq1.append(scoring_format.ambiguous_match)
-                score_aligned_seq2.append(scoring_format.ambiguous_match)
             else:
                 score_aligned_seq1.append(scoring_format.match)
-                score_aligned_seq2.append(scoring_format.match)
             pos += 1
 
     # Add end-trimmed markers for positions after scoring region
     for i in range(scoring_end + 1, total_alignment_length):
         score_aligned_seq1.append(scoring_format.end_trimmed)
-        score_aligned_seq2.append(scoring_format.end_trimmed)
 
     # Calculate coverage as fraction of sequence used in alignment region
     seq1_coverage = seq1_coverage_positions / seq1_total_length if seq1_total_length > 0 else 0.0
@@ -1242,7 +1202,6 @@ def score_alignment(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_
 
     # Create scoring codes strings for visualization
     score_aligned_str = ''.join(score_aligned_seq1)
-    score_aligned_str_seq2 = ''.join(score_aligned_seq2)
 
     # Calculate identity metric: identity = 1 - (edits / scored_positions)
     identity = 1.0 - (edits / scored_positions) if scored_positions > 0 else 1.0
@@ -1256,8 +1215,7 @@ def score_alignment(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_
         seq2_coverage=seq2_coverage,
         seq1_aligned=seq1_aligned,
         seq2_aligned=seq2_aligned,
-        score_aligned=score_aligned_str,
-        score_aligned_seq2=score_aligned_str_seq2
+        score_aligned=score_aligned_str
     )
 
 

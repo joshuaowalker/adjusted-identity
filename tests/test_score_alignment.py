@@ -679,8 +679,8 @@ class TestEdgeCases:
         assert result.mismatches == 0
         # With new variant range algorithm, all-gap regions have no content to score
         assert result.scored_positions == 0
-        # Visualization still shows match markers for dual-gaps
-        assert result.score_aligned == "||||"
+        # Dual-gaps are shown with the dual_gap marker ('.' by default)
+        assert result.score_aligned == "...."
     
     def test_unequal_length_sequences(self):
         """Aligned sequences of different lengths should raise error."""
@@ -886,8 +886,8 @@ class TestMSADualGaps:
         # The 'T' at position 3 should be recognized as extending the 'TT' at positions 5-6
         assert result.identity == 1.0, f"Expected 1.0, got {result.identity}"
         assert result.mismatches == 0
-        # Score pattern: AGA (|||) + dual-gap (|) + T extension (=) + dual-gap (|) + TT (||)
-        assert result.score_aligned == "|||=|||"
+        # Score pattern: AGA (|||) + T extension (=) + dual-gap (.) + TT (||)
+        assert result.score_aligned == "|||=.||"
 
     def test_dual_gap_left_context_homopolymer(self):
         """Case: AAA--TTT vs AA-A-TTT - both 'A's should be recognized as homopolymer extensions."""
@@ -896,8 +896,8 @@ class TestMSADualGaps:
         # Both 'A's at positions 2 and 3 should extend the 'AA' at positions 0-1
         assert result.identity == 1.0, f"Expected 1.0, got {result.identity}"
         assert result.mismatches == 0
-        # Score pattern: AA (||) + A extension (=) + A extension (=) + dual-gap (|) + TTT (|||)
-        assert result.score_aligned == "||==||||"
+        # Score pattern: AA (||) + A extension (=) + A extension (=) + dual-gap (.) + TTT (|||)
+        assert result.score_aligned == "||==.|||"
 
     def test_dual_gap_skipped_for_context(self):
         """Case: CTT--GCTGGC vs CTT-TGCTGGC - context extraction skips dual-gap to find homopolymer."""
@@ -908,14 +908,14 @@ class TestMSADualGaps:
         # Context extraction must skip the dual-gap at position 3 to find 'T' context
         assert result.identity == 1.0, f"Expected 1.0, got {result.identity}"
         assert result.mismatches == 0
-        # Score pattern: CTT (|||) + dual-gap (|) + T extension (=) + GCTGGC (||||||)
-        assert result.score_aligned == "||||=||||||"
+        # Score pattern: CTT (|||) + dual-gap (.) + T extension (=) + GCTGGC (||||||)
+        assert result.score_aligned == "|||.=||||||"
 
         # Test with sequences reversed (gap in seq2) - should be symmetric
         result_reversed = score_alignment("CTT-TGCTGGC", "CTT--GCTGGC", DEFAULT_ADJUSTMENT_PARAMS)
         assert result_reversed.identity == 1.0, f"Expected 1.0, got {result_reversed.identity}"
         assert result_reversed.mismatches == 0
-        assert result_reversed.score_aligned == "||||=||||||"
+        assert result_reversed.score_aligned == "|||.=||||||"
 
     def test_dual_gap_not_homopolymer(self):
         """Case: AGT-AC vs AG-GAC - variant range with different alleles."""
@@ -951,13 +951,13 @@ class TestMSADualGaps:
         assert result.mismatches == 0
         # Scored positions: TGC (3) + variant range (0, both pure extensions) + TC (2) = 5
         assert result.scored_positions == 5
-        assert result.score_aligned == "|||==|||"  # == shows both extensions, dual-gap as |
+        assert result.score_aligned == "|||==.||"  # == shows both extensions, dual-gap as .
 
         # Test reversed - should be symmetric
         result_rev = score_alignment("TGCT--TC", "TGC-C-TC", DEFAULT_ADJUSTMENT_PARAMS)
         assert result_rev.identity == 1.0
         assert result_rev.mismatches == 0
-        assert result_rev.score_aligned == "|||==|||"
+        assert result_rev.score_aligned == "|||==.||"
 
     def test_dual_gap_same_char_homopolymer(self):
         """Case: AGG-AC vs AG-GAC - both 'G's should be recognized as homopolymer extensions."""
@@ -995,11 +995,9 @@ class TestMSADualGaps:
         # - Result: identity = 1.0
         assert result.identity == 1.0
         assert result.mismatches == 0
-        # Visualization: each string has same count of = markers (2 for 2 HP extensions)
-        # score_aligned: core at pos 5 shows |, extensions at 9-10 show ==
-        # score_aligned_seq2: gap at pos 5 absorbs = marker, core at 9 shows |, gap at 10 shows =
-        assert result.score_aligned == "|||||||||==|||||||||"
-        assert result.score_aligned_seq2 == "|||||=||||=|||||||||"
+        # Visualization: dual-gaps (positions 6-8) show as '.' markers
+        # score_aligned: CCTTTC (||||||) + dual-gaps (...) + TT extensions (==) + remaining (|||||||||)
+        assert result.score_aligned == "||||||...==|||||||||"
 
     def test_floating_nucleotide_between_homopolymer_runs(self):
         """Floating nucleotide between HP runs should show = markers, not space.
@@ -1026,15 +1024,12 @@ class TestMSADualGaps:
 
         assert result.identity == 1.0
         assert result.mismatches == 0
-        # Both scoring strings should have same count of = markers
-        assert result.score_aligned.count('=') == result.score_aligned_seq2.count('=')
         # Position 11 (gap in read, C core in consensus) should show = not space
         assert result.score_aligned[11] == '='
         # Position 15 (C core in read, T extension in consensus) should show | for read
         assert result.score_aligned[15] == '|'
-        # Verify no spaces in scoring strings (no errors counted)
+        # Verify no spaces in scoring string (no errors counted)
         assert ' ' not in result.score_aligned
-        assert ' ' not in result.score_aligned_seq2
 
     def test_dual_gaps_in_context_region(self):
         """Dual-gaps in context region should be skipped when extracting context."""
@@ -1087,13 +1082,15 @@ class TestMSADualGaps:
         assert result.scored_positions >= 2  # At least the matching positions
 
     def test_dual_gap_scoring_visualization(self):
-        """Verify that dual-gaps use the match marker '|' in score_aligned."""
+        """Verify that dual-gaps use the dual_gap marker '.' in score_aligned."""
         result = score_alignment("A--T", "A--T", DEFAULT_ADJUSTMENT_PARAMS)
 
-        # All positions match, including the dual-gaps
-        assert result.score_aligned == "||||"
+        # A and T are matches (|), dual-gaps are marked with '.'
+        assert result.score_aligned == "|..|"
         assert result.identity == 1.0
         assert result.mismatches == 0
+        # Dual-gaps are NOT counted in scored_positions
+        assert result.scored_positions == 2
 
     def test_dual_gap_mixed_with_regular_indels(self):
         """Complex case with both dual-gaps and regular indels."""
@@ -1169,7 +1166,8 @@ class TestVariantRangeAlgorithm:
         result = score_alignment("TGC-C-TC", "TGCT--TC", DEFAULT_ADJUSTMENT_PARAMS)
         assert result.identity == 1.0
         assert result.mismatches == 0
-        assert result.score_aligned == "|||==|||"
+        # Extensions show as '=', dual-gap at position 5 shows as '.'
+        assert result.score_aligned == "|||==.||"
 
     def test_opposite_direction_with_core_content(self):
         """Alleles extend in opposite directions but also have core content."""
@@ -1181,8 +1179,8 @@ class TestVariantRangeAlgorithm:
         result = score_alignment("TGC-CX-TC", "TGCT---TC", DEFAULT_ADJUSTMENT_PARAMS)
         assert result.identity < 1.0
         assert result.mismatches == 1  # X core counts as 1 edit
-        # T(pos3)=extension, C(pos4)=extension, X(pos5)=core(space), dual-gap(pos6)=match
-        assert result.score_aligned == "|||== |||"
+        # T(pos3)=extension, C(pos4)=extension, X(pos5)=core(space), dual-gap(pos6)='.'
+        assert result.score_aligned == "|||== .||"
 
     def test_both_alleles_have_core_same_content(self):
         """Both alleles have core content that's identical."""
@@ -1359,15 +1357,17 @@ class TestVariantRangeAlgorithm:
         """When both alleles are pure extensions, show '=' markers."""
         # C extends C (left), T extends T (right) → both pure
         result = score_alignment("TGC-C-TC", "TGCT--TC", DEFAULT_ADJUSTMENT_PARAMS)
-        assert result.score_aligned == "|||==|||"
+        # Extensions show as '=', dual-gap at position 5 shows as '.'
+        assert result.score_aligned == "|||==.||"
         assert result.mismatches == 0
 
     def test_score_visualization_one_extension_one_core(self):
         """When one allele extends and other has core, show substitution marker."""
         # T extends T (right context), C doesn't extend → C is core
         # The space at position 5 indicates the mismatch
+        # Dual-gaps at positions 3 and 7-9 show as '.'
         result = score_alignment("TTG-ATT---T", "TTG-ACT---T", DEFAULT_ADJUSTMENT_PARAMS)
-        assert result.score_aligned == "||||| |||||"
+        assert result.score_aligned == "|||.| |...|"
         assert result.mismatches == 1
 
     def test_score_visualization_both_have_different_core(self):
