@@ -107,11 +107,11 @@ print(f"Score pattern: {result.score_aligned}")  # Shows '=' for ambiguous match
 
 The `score_aligned` field provides a visual representation of how each position was scored:
 
-- `|` = Exact match between standard nucleotides (A=A, C=C, G=G, T=T) or dual-gap ('-' vs '-')
-- `=` = Ambiguous match (IUPAC codes) or homopolymer extension
+- `|` = Exact match between standard nucleotides (A=A, C=C, G=G, T=T)
+- `=` = Ambiguous match (IUPAC codes) or homopolymer/repeat extension
 - ` ` (space) = Substitution (mismatch)
 - `-` = Indel extension (normalized)
-- `.` = End-trimmed position (not scored)
+- `.` = End-trimmed, dual-gap, or overhang position (not scored)
 
 ```python
 from adjusted_identity import align_and_score
@@ -171,7 +171,7 @@ print(f"MSA identity: {result.identity:.3f}")  # Both G's recognized as homopoly
 ```
 
 **Key MSA features:**
-- **Dual-gap handling**: Positions where both sequences have '-' are treated as matches
+- **Dual-gap handling**: Positions where both sequences have '-' are excluded from scoring (marked with `.`)
 - **Consensus context**: Homopolymer detection uses consensus nucleotides from both sequences
 - **Conflict resolution**: When sequences disagree at context positions, homopolymer extension is not applied
 
@@ -497,12 +497,11 @@ print(result.score_aligned)  # "|||=|||"
 ```
 
 Scoring symbols:
-- `|`: Exact match or IUPAC equivalent
-- ` `: Nucleotide substitution (counts as mismatch)
-- ` `: First position of indel (counts as mismatch)
-- `-`: Indel extension positions (ignored if normalization enabled)
-- `=`: Homopolymer extension (ignored if adjustment enabled)
-- `.`: End-trimmed position (ignored in scoring)
+- `|`: Exact match (A=A, C=C, G=G, T=T)
+- `=`: Ambiguous match (IUPAC) or homopolymer/repeat extension
+- ` ` (space): Substitution or indel start (counts as mismatch)
+- `-`: Indel extension (ignored if normalization enabled)
+- `.`: End-trimmed, dual-gap, or overhang (not scored)
 
 ## Testing
 
@@ -529,6 +528,36 @@ The test suite includes:
 ## Background
 
 This package implements the sequence preprocessing approach described in the MycoBLAST algorithm by Stephen Russell and Mycota Lab, adapted for general-purpose DNA sequence comparison. The foundational research is detailed in ["Why NCBI BLAST identity scores can be misleading for fungi"](https://mycotalab.substack.com/p/why-ncbi-blast-identity-scores-can).
+
+### How the Variant Range Algorithm Works
+
+Starting in v0.2.0, this package uses a **variant range algorithm** that provides more accurate scoring for complex indel patterns, especially in multi-sequence alignments.
+
+**The key insight**: Standard aligners don't know about homopolymers—they just find the minimum-edit alignment. This can produce patterns where a simple homopolymer expansion looks like a complex substitution or scattered indels.
+
+**How it works:**
+
+1. **Find variant ranges**: Scan the alignment for contiguous regions where sequences differ (gaps, mismatches, or both). These are bounded by matching positions on each side.
+
+2. **Extract alleles**: For each variant range, pull out the gap-free content from each sequence. For example, in `TGC-C-TC` vs `TGCT--TC`, the variant range yields alleles `"C"` and `"T"`.
+
+3. **Check for extensions**: Ask whether each allele could be explained as a repeat of the adjacent context:
+   - Does `"C"` extend the left context `C`? Yes (homopolymer)
+   - Does `"T"` extend the right context `T`? Yes (homopolymer)
+
+4. **Apply Occam's razor**: If both alleles are valid extensions of their respective contexts, they represent equivalent repeat expansions → **0 edits**. No mismatch is counted because both placements are biologically plausible.
+
+**Example:**
+```
+seq1: ATTCA     Traditional scoring: 1 substitution (T vs C)
+seq2: ATCCA     Variant range: T extends left T, C extends right C → 0 edits
+```
+
+This approach handles cases that position-by-position algorithms miss, such as "floating" nucleotides in MSA data where gap placement is arbitrary.
+
+For the complete specification, see [docs/SCORING_SPEC.md](docs/SCORING_SPEC.md).
+
+### Why These Adjustments Matter
 
 The adjustments are particularly valuable for:
 
@@ -559,7 +588,7 @@ GitHub: https://github.com/joshuaowalker/adjusted-identity
 **Please also cite the foundational work:**
 
 ```
-Russell, S. (2024). Why NCBI BLAST identity scores can be misleading for fungi. 
+Russell, S. (2025). Why NCBI BLAST identity scores can be misleading for fungi.
 Mycota Lab. https://mycotalab.substack.com/p/why-ncbi-blast-identity-scores-can
 ```
 
