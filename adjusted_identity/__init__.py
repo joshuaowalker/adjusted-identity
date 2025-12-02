@@ -859,26 +859,16 @@ def _generate_variant_score_string(seq1_aligned, seq2_aligned, start, end,
     Returns:
         str: Score visualization string for this variant range
     """
-    # Build position classification sets for seq1
-    seq1_left_ext_positions = set(allele1_positions[:analysis1.left_extension_count])
-    seq1_right_ext_positions = set(allele1_positions[-analysis1.right_extension_count:]
-                                   if analysis1.right_extension_count > 0 else [])
-    seq1_ext_positions = seq1_left_ext_positions | seq1_right_ext_positions
+    # Build extension position sets for each sequence
+    # Note: Extension and core positions form a partition of all content positions,
+    # so is_core = not is_ext (no need to build separate core position sets)
+    left1, right1 = analysis1.left_extension_count, analysis1.right_extension_count
+    left2, right2 = analysis2.left_extension_count, analysis2.right_extension_count
 
-    # Build position classification sets for seq2
-    seq2_left_ext_positions = set(allele2_positions[:analysis2.left_extension_count])
-    seq2_right_ext_positions = set(allele2_positions[-analysis2.right_extension_count:]
-                                   if analysis2.right_extension_count > 0 else [])
-    seq2_ext_positions = seq2_left_ext_positions | seq2_right_ext_positions
-
-    # Calculate core positions for each allele
-    core1_start = analysis1.left_extension_count
-    core1_end = len(allele1_positions) - analysis1.right_extension_count
-    seq1_core_positions = set(allele1_positions[core1_start:core1_end]) if core1_end > core1_start else set()
-
-    core2_start = analysis2.left_extension_count
-    core2_end = len(allele2_positions) - analysis2.right_extension_count
-    seq2_core_positions = set(allele2_positions[core2_start:core2_end]) if core2_end > core2_start else set()
+    seq1_ext_positions = (set(allele1_positions[:left1]) |
+                          set(allele1_positions[-right1:] if right1 > 0 else []))
+    seq2_ext_positions = (set(allele2_positions[:left2]) |
+                          set(allele2_positions[-right2:] if right2 > 0 else []))
 
     # Determine if cores match (for visualization - matched cores show as |)
     cores_match = analysis1.core_content == analysis2.core_content
@@ -902,41 +892,37 @@ def _generate_variant_score_string(seq1_aligned, seq2_aligned, start, end,
 
         # Case 2: Both have content
         if char1 != '-' and char2 != '-':
-            # When homopolymer normalization is disabled, treat all content as core (no extensions)
+            # When homopolymer normalization is disabled, is_ext is always False (all content is core)
             is_ext1 = adjustment_params.normalize_homopolymers and pos in seq1_ext_positions
             is_ext2 = adjustment_params.normalize_homopolymers and pos in seq2_ext_positions
-            is_core1 = pos in seq1_core_positions or not adjustment_params.normalize_homopolymers
-            is_core2 = pos in seq2_core_positions or not adjustment_params.normalize_homopolymers
+            # Extension and core partition content positions, so is_core = not is_ext
+            is_core1 = not is_ext1
+            is_core2 = not is_ext2
 
-            # If one is extension and other is core, show based on whether cores match
-            if (is_ext1 and is_core2) or (is_ext2 and is_core1):
-                if cores_match:
-                    # Cores match - show extension marker for seq1's extension, match for seq1's core
-                    score_chars.append(ext_marker if is_ext1 else scoring_format.match)
-                else:
-                    # Cores differ - mismatch counted
-                    score_chars.append(scoring_format.substitution)
-            elif is_ext1 and is_ext2:
+            if is_ext1 and is_ext2:
                 # Both extensions - show extension marker
                 score_chars.append(ext_marker)
             elif is_core1 and is_core2:
                 # Both core - show match or mismatch based on core comparison
                 score_chars.append(scoring_format.match if cores_match else scoring_format.substitution)
             else:
-                # Fallback (shouldn't happen normally)
-                score_chars.append(scoring_format.substitution)
+                # One is extension, one is core - show based on whether cores match
+                if cores_match:
+                    # Cores match - show extension marker for seq1's extension, match for seq1's core
+                    score_chars.append(ext_marker if is_ext1 else scoring_format.match)
+                else:
+                    # Cores differ - mismatch counted
+                    score_chars.append(scoring_format.substitution)
             continue
 
         # Case 3: seq1 has gap, seq2 has content
         if char1 == '-':
-            # When homopolymer normalization is disabled, treat all content as indels (no extensions)
             is_ext2 = adjustment_params.normalize_homopolymers and pos in seq2_ext_positions
-            is_core2 = pos in seq2_core_positions or not adjustment_params.normalize_homopolymers
 
             if is_ext2:
-                # seq2 is extension - seq1 borrows extension marker
+                # seq2 is extension - show extension marker
                 score_chars.append(ext_marker)
-            elif is_core2:
+            else:
                 # seq2 is core - check if cores match (only when HP normalization enabled)
                 if adjustment_params.normalize_homopolymers and cores_match:
                     # Cores match - seq1 (gap) absorbs extension → show extension marker
@@ -948,21 +934,16 @@ def _generate_variant_score_string(seq1_aligned, seq2_aligned, start, end,
                     else:
                         score_chars.append(scoring_format.indel_start)
                         seen_core_start = True
-            else:
-                # Fallback (shouldn't happen)
-                score_chars.append(scoring_format.substitution)
             continue
 
         # Case 4: seq1 has content, seq2 has gap
         if char2 == '-':
-            # When homopolymer normalization is disabled, treat all content as indels (no extensions)
             is_ext1 = adjustment_params.normalize_homopolymers and pos in seq1_ext_positions
-            is_core1 = pos in seq1_core_positions or not adjustment_params.normalize_homopolymers
 
             if is_ext1:
-                # seq1 is extension
+                # seq1 is extension - show extension marker
                 score_chars.append(ext_marker)
-            elif is_core1:
+            else:
                 # seq1 is core - check if cores match (only when HP normalization enabled)
                 if adjustment_params.normalize_homopolymers and cores_match:
                     # Cores match - seq1 (core) is the matching core → show match marker
@@ -974,9 +955,6 @@ def _generate_variant_score_string(seq1_aligned, seq2_aligned, start, end,
                     else:
                         score_chars.append(scoring_format.indel_start)
                         seen_core_start = True
-            else:
-                # Fallback (shouldn't happen)
-                score_chars.append(scoring_format.substitution)
             continue
 
     return ''.join(score_chars)
