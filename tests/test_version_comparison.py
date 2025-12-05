@@ -7,10 +7,19 @@ detailed context when differences are found. This allows us to:
 1. Discover where the algorithms differ
 2. Analyze each difference to understand the cause
 3. Decide if the difference is an improvement, behavioral change, or regression
+
+NOTE: These tests require git access to origin/main and are skipped in CI.
 """
 
+import os
 import pytest
 from pathlib import Path
+
+# Skip all tests in this module when running in CI (no git origin access)
+pytestmark = pytest.mark.skipif(
+    os.environ.get("CI") == "true",
+    reason="Version comparison tests require git origin/main access (skipped in CI)"
+)
 from itertools import combinations
 
 from .compare_versions import (
