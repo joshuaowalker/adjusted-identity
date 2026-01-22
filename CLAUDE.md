@@ -30,10 +30,13 @@ adjusted-identity/
 
 ### Installation
 ```bash
+# Install from PyPI
+pip install adjusted-identity
+
 # Development installation with test dependencies
 pip install -e ".[dev]"
 
-# Install from GitHub
+# Install from GitHub (latest development version)
 pip install git+https://github.com/joshuaowalker/adjusted-identity.git
 ```
 
@@ -63,7 +66,7 @@ python -m build
 # Check package metadata
 python setup.py check
 
-# Upload to PyPI (when ready)
+# Upload to PyPI (uses trusted publishing via GitHub Actions)
 twine upload dist/*
 ```
 
@@ -84,7 +87,7 @@ twine upload dist/*
 3. **Adjustment Features**:
    - Homopolymer length normalization - ignores differences in homopolymer run lengths
    - IUPAC ambiguity code handling - allows different ambiguity codes to match
-   - End trimming - skips mismatches in terminal regions (default 20bp)
+   - End trimming - skips mismatches in terminal regions (disabled by default, set `end_skip_distance` to enable)
    - Indel normalization - counts contiguous indels as single events
 
 ### Key Constants

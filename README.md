@@ -1,5 +1,8 @@
 # Adjusted Identity Calculator for DNA Sequences
 
+[![PyPI version](https://badge.fury.io/py/adjusted-identity.svg)](https://pypi.org/project/adjusted-identity/)
+[![CI](https://github.com/joshuaowalker/adjusted-identity/actions/workflows/ci.yml/badge.svg)](https://github.com/joshuaowalker/adjusted-identity/actions/workflows/ci.yml)
+
 A Python package implementing MycoBLAST-style sequence identity calculations for DNA sequences, specifically designed for mycological DNA barcoding applications. This package provides sophisticated sequence alignment and scoring with various adjustments for homopolymer differences, IUPAC ambiguity codes, and sequencing artifacts.
 
 **Based on the MycoBLAST algorithm developed by Stephen Russell and Mycota Lab.** See the foundational article: ["Why NCBI BLAST identity scores can be misleading for fungi"](https://mycotalab.substack.com/p/why-ncbi-blast-identity-scores-can) which explains the theoretical basis and motivation for these sequence preprocessing adjustments.
@@ -17,7 +20,13 @@ A Python package implementing MycoBLAST-style sequence identity calculations for
 
 ## Installation
 
-### From GitHub
+### From PyPI
+
+```bash
+pip install adjusted-identity
+```
+
+### From GitHub (latest development version)
 
 ```bash
 pip install git+https://github.com/joshuaowalker/adjusted-identity.git
@@ -597,6 +606,14 @@ Mycota Lab. https://mycotalab.substack.com/p/why-ncbi-blast-identity-scores-can
 BSD 2-Clause License - see [LICENSE](LICENSE) file for details.
 
 ## Changelog
+
+### Version 0.2.4
+- Added CI workflow to run tests automatically on push and pull requests
+- Fixed setuptools compatibility by removing legacy license classifier
+
+### Version 0.2.3
+- **Published to PyPI**: Package now available via `pip install adjusted-identity`
+- Added GitHub Actions workflow for automated PyPI publishing with trusted publishing
 
 ### Version 0.2.2
 
