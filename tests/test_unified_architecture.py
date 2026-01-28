@@ -44,7 +44,15 @@ class TestUnifiedMetrics:
         ("ATCG-ATCG", "ATCGAATCG"),
         # Dual gaps
         ("AA--TT", "AA--TT"),
-        # Complex variant with trailing gap
+        # Complex variant with trailing gap (known limitation)
+        # Biological interpretation: This is a pure homopolymer difference (7 T's vs 4 T's)
+        # with identical GCA suffix. Ideally: identity=1.0, mismatches=0.
+        # Actual: identity=10/11, mismatches=1. The trailing gap (A/-) at position 12 is
+        # excluded from the scoring region (which requires both sequences to have content),
+        # so the variant range is truncated to positions 9-11 ("TGC" vs "GCA") instead of
+        # 9-12 ("TGCA" vs "GCA"). This causes core comparison of "GC" vs "GCA" = 1 edit.
+        # We accept this compromise because scoring region truncation is essential for
+        # handling the more common case of terminal differences from primer variation.
         ("GCATTTTTTTGCA", "GCAT-TTTTGCA-"),
     ])
     def test_metrics_identical_for_both_modes(self, seq1, seq2):
