@@ -155,29 +155,24 @@ class TestAdjustGapsTrueMetrics:
     """
     Test HEAD with adjust_gaps=True behavior.
 
-    When using adjust_gaps=True, gap rewriting can change the alignment structure
-    which may cause metrics (mismatches, scored_positions, identity) to differ
-    from origin/main. The aligned strings are expected to differ (that's the
-    point of adjust_gaps).
+    With the unified architecture, adjust_gaps=True and adjust_gaps=False
+    now produce IDENTICAL metrics. The aligned strings differ (that's the
+    point of adjust_gaps), but the metrics are computed from a single analysis
+    pass on the original alignment.
 
-    These tests document the current behavior. Some are marked xfail where
-    metrics are known to differ.
+    These tests verify that both modes produce matching metrics.
     """
 
-    @pytest.mark.xfail(
-        reason="Gap rewriting can change mismatch counts by reclassifying content as extensions"
-    )
     @pytest.mark.skipif(
         not SAMPLE_FASTA.exists(),
         reason=f"Sample FASTA not found: {SAMPLE_FASTA}"
     )
     def test_sample_fasta_pairwise_mismatches(self):
         """
-        Test if mismatch counts match with adjust_gaps=True.
+        Test that mismatch counts are identical between adjust_gaps=True and adjust_gaps=False.
 
-        Gap rewriting can change both scored_positions AND mismatch counts
-        by reclassifying content as homopolymer extensions. This test documents
-        that behavior. Limited to 1000 pairs.
+        With unified architecture, both modes use the same analysis pass,
+        so mismatch counts are always identical. Limited to 1000 pairs.
         """
         from itertools import combinations
 
@@ -204,19 +199,16 @@ class TestAdjustGapsTrueMetrics:
                 f"{comparison.format_adjust_true_diff()}"
             )
 
-    @pytest.mark.xfail(
-        reason="Gap rewriting can change scored_positions and identity"
-    )
     @pytest.mark.skipif(
         not SAMPLE_FASTA.exists(),
         reason=f"Sample FASTA not found: {SAMPLE_FASTA}"
     )
     def test_sample_fasta_pairwise_all_metrics(self):
         """
-        Test if all metrics match with adjust_gaps=True.
+        Test that all metrics are identical between adjust_gaps=True and adjust_gaps=False.
 
-        Gap rewriting can change the alignment interpretation, causing
-        metrics to differ. This test documents that behavior.
+        With unified architecture, both modes use the same analysis pass,
+        so all metrics are always identical.
         """
         total, diff_count, differences = compare_head_fasta_pairwise(
             str(SAMPLE_FASTA),
@@ -237,10 +229,8 @@ class TestAdjustGapsTrueMetrics:
     def test_simple_cases_metrics(self):
         """Simple test cases should have matching metrics."""
         # Note: score_alignment expects pre-aligned sequences with equal lengths
-        # Note: Some complex gap patterns (like "A--TGC" vs "ATT-GC") may have
-        # different metrics with adjust_gaps=True because the gap rewriting
-        # process can fundamentally change the alignment interpretation.
-        # Those cases are excluded since the primary test is adjust_gaps=False identity.
+        # With unified architecture, all cases produce identical metrics for
+        # both adjust_gaps=True and adjust_gaps=False.
         test_cases = [
             # (seq1, seq2, description)
             ("ATCG", "ATCG", "Perfect match"),

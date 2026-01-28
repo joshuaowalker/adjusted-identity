@@ -1020,13 +1020,17 @@ def _generate_variant_score_string(seq1_aligned, seq2_aligned, start, end,
     return ''.join(score_chars)
 
 
-def _analyze_alignment(seq1_aligned, seq2_aligned, adjustment_params=None):
+def _unified_analysis(seq1_aligned, seq2_aligned, adjustment_params=None):
     """
-    Analyze alignment to extract variant range information for gap adjustment.
+    Unified analysis of alignment extracting variant range information and computing metrics.
 
-    This function performs the same analysis as _score_alignment_impl but returns
-    an AlignmentAnalysis object with detailed variant range information instead
-    of just the final AlignmentResult.
+    This is the single source of truth for alignment metrics. Both adjust_gaps=True
+    and adjust_gaps=False code paths use this function, ensuring consistent metrics
+    regardless of output mode.
+
+    Returns an AlignmentAnalysis object with all computed metrics and detailed
+    variant range information needed to generate either "stuffed" or "adjusted"
+    output alignments.
 
     Args:
         seq1_aligned (str): First sequence with gaps ('-') inserted
@@ -1275,7 +1279,7 @@ def _adjust_alignment_gaps(seq1_aligned, seq2_aligned, analysis, adjustment_para
 
     Args:
         seq1_aligned, seq2_aligned: Original aligned sequences
-        analysis: AlignmentAnalysis from _analyze_alignment
+        analysis: AlignmentAnalysis from _unified_analysis
         adjustment_params: AdjustmentParams for scoring behavior
 
     Returns:
@@ -1321,11 +1325,220 @@ def _adjust_alignment_gaps(seq1_aligned, seq2_aligned, analysis, adjustment_para
     return ''.join(result_seq1), ''.join(result_seq2)
 
 
+def _generate_stuffed_score_string(seq1_aligned, seq2_aligned, analysis, adjustment_params, scoring_format):
+    """
+    Generate "stuffed" score string for original alignment (adjust_gaps=False).
+
+    This generates a scoring visualization where gap positions are "stuffed" with
+    markers based on the variant range analysis. The visualization reflects how
+    positions were scored using the unified analysis.
+
+    Args:
+        seq1_aligned, seq2_aligned: Original aligned sequences (unchanged)
+        analysis: AlignmentAnalysis from _unified_analysis
+        adjustment_params: AdjustmentParams for scoring behavior
+        scoring_format: ScoringFormat for visualization
+
+    Returns:
+        str: Scoring visualization string matching original alignment length
+    """
+    total_length = len(seq1_aligned)
+    score_chars = []
+
+    # Add end-trimmed markers for positions before scoring region
+    for _ in range(analysis.scoring_start):
+        score_chars.append(scoring_format.end_trimmed)
+
+    # Build lookup for variant ranges by start position
+    vr_by_start = {vr.start: vr for vr in analysis.variant_ranges}
+
+    # Process positions in scoring region
+    pos = analysis.scoring_start
+    while pos <= analysis.scoring_end:
+        # Check if this position starts a variant range
+        if pos in vr_by_start:
+            vr_info = vr_by_start[pos]
+
+            # Generate score string for this variant range using existing function
+            vr_score_str = _generate_variant_score_string(
+                seq1_aligned, seq2_aligned, vr_info.start, vr_info.end,
+                vr_info.analysis1, vr_info.analysis2,
+                vr_info.allele1_positions, vr_info.allele2_positions,
+                scoring_format, adjustment_params
+            )
+            score_chars.append(vr_score_str)
+
+            # Move past this variant range
+            pos = vr_info.end + 1
+        else:
+            # Match position or dual-gap
+            char1, char2 = seq1_aligned[pos], seq2_aligned[pos]
+
+            if char1 == '-' and char2 == '-':
+                # Dual-gap (MSA artifact - not scored)
+                score_chars.append(scoring_format.dual_gap)
+            else:
+                # Match position - check for ambiguous match
+                is_match, is_ambiguous = _are_nucleotides_equivalent(
+                    char1, char2, adjustment_params.handle_iupac_overlap)
+                if is_ambiguous:
+                    score_chars.append(scoring_format.ambiguous_match)
+                else:
+                    score_chars.append(scoring_format.match)
+            pos += 1
+
+    # Add end-trimmed markers for positions after scoring region
+    for _ in range(analysis.scoring_end + 1, total_length):
+        score_chars.append(scoring_format.end_trimmed)
+
+    return ''.join(score_chars)
+
+
+def _generate_stuffed_output(seq1_aligned, seq2_aligned, analysis, adjustment_params, scoring_format):
+    """
+    Generate AlignmentResult for adjust_gaps=False using original alignment strings.
+
+    The alignment strings are preserved as-is. The score string is generated to
+    reflect how positions were scored using the unified analysis.
+
+    Args:
+        seq1_aligned, seq2_aligned: Original aligned sequences
+        analysis: AlignmentAnalysis from _unified_analysis
+        adjustment_params: AdjustmentParams for scoring behavior
+        scoring_format: ScoringFormat for visualization
+
+    Returns:
+        AlignmentResult: Result with original alignment strings and stuffed score string
+    """
+    score_aligned = _generate_stuffed_score_string(
+        seq1_aligned, seq2_aligned, analysis, adjustment_params, scoring_format
+    )
+
+    return AlignmentResult(
+        identity=analysis.identity,
+        mismatches=analysis.mismatches,
+        scored_positions=analysis.scored_positions,
+        seq1_coverage=analysis.seq1_coverage,
+        seq2_coverage=analysis.seq2_coverage,
+        seq1_aligned=seq1_aligned,
+        seq2_aligned=seq2_aligned,
+        score_aligned=score_aligned
+    )
+
+
+def _generate_adjusted_score_string(adj_seq1, adj_seq2, analysis, adjustment_params, scoring_format):
+    """
+    Generate intuitive score string for gap-adjusted alignment.
+
+    In the adjusted alignment, gap positions naturally align with the scoring
+    analysis, making the visualization more intuitive. This function generates
+    a score string where:
+    - Extension positions show extension marker (=)
+    - Core positions show match (|) or mismatch ( )
+    - Match positions show match (|) or ambiguous match (=)
+
+    Args:
+        adj_seq1, adj_seq2: Gap-adjusted aligned sequences
+        analysis: AlignmentAnalysis from _unified_analysis
+        adjustment_params: AdjustmentParams for scoring behavior
+        scoring_format: ScoringFormat for visualization
+
+    Returns:
+        str: Scoring visualization string for adjusted alignment
+    """
+    adj_length = len(adj_seq1)
+    score_chars = []
+
+    # Adjusted alignment may have different length than original
+    # We need to track position mapping through the adjustment
+
+    # For the adjusted alignment, we iterate through positions and generate
+    # appropriate markers based on content
+    for pos in range(adj_length):
+        char1 = adj_seq1[pos]
+        char2 = adj_seq2[pos]
+
+        # Dual-gap (should be rare in adjusted alignment within scoring region)
+        if char1 == '-' and char2 == '-':
+            score_chars.append(scoring_format.dual_gap)
+            continue
+
+        # Both have content
+        if char1 != '-' and char2 != '-':
+            # Check if they match
+            is_match, is_ambiguous = _are_nucleotides_equivalent(
+                char1, char2, adjustment_params.handle_iupac_overlap)
+            if is_match:
+                if is_ambiguous:
+                    score_chars.append(scoring_format.ambiguous_match)
+                else:
+                    score_chars.append(scoring_format.match)
+            else:
+                score_chars.append(scoring_format.substitution)
+            continue
+
+        # One has content, one has gap - this is an extension or core indel position
+        # In the adjusted alignment, gaps adjacent to matching context are extensions
+        if adjustment_params.normalize_homopolymers:
+            score_chars.append(scoring_format.homopolymer_extension)
+        else:
+            score_chars.append(scoring_format.indel_extension)
+
+    return ''.join(score_chars)
+
+
+def _generate_adjusted_output(seq1_aligned, seq2_aligned, analysis, adjustment_params, scoring_format):
+    """
+    Generate AlignmentResult for adjust_gaps=True with gap-adjusted alignment.
+
+    The alignment is adjusted so gap positions match the scoring analysis,
+    making the visualization more intuitive to interpret position-by-position.
+
+    Args:
+        seq1_aligned, seq2_aligned: Original aligned sequences
+        analysis: AlignmentAnalysis from _unified_analysis
+        adjustment_params: AdjustmentParams for scoring behavior
+        scoring_format: ScoringFormat for visualization
+
+    Returns:
+        AlignmentResult: Result with adjusted alignment strings and intuitive score string
+    """
+    # Adjust the alignment gaps using the analysis
+    adj_seq1, adj_seq2 = _adjust_alignment_gaps(
+        seq1_aligned, seq2_aligned, analysis, adjustment_params
+    )
+
+    # Generate score string for the adjusted alignment
+    score_aligned = _generate_adjusted_score_string(
+        adj_seq1, adj_seq2, analysis, adjustment_params, scoring_format
+    )
+
+    return AlignmentResult(
+        identity=analysis.identity,
+        mismatches=analysis.mismatches,
+        scored_positions=analysis.scored_positions,
+        seq1_coverage=analysis.seq1_coverage,
+        seq2_coverage=analysis.seq2_coverage,
+        seq1_aligned=adj_seq1,
+        seq2_aligned=adj_seq2,
+        score_aligned=score_aligned
+    )
+
+
 def _score_alignment_impl(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_format=None):
     """
-    Internal implementation: Score alignment and count edits with configurable MycoBLAST-style adjustments.
+    DEPRECATED: Legacy scoring implementation kept for reference.
 
-    This is the internal implementation. Use score_alignment() for the public API.
+    This function is no longer used by score_alignment(). The unified architecture
+    now uses _unified_analysis() with _generate_stuffed_output() or _generate_adjusted_output()
+    to ensure both adjust_gaps=True and adjust_gaps=False produce identical metrics.
+
+    This implementation is preserved for reference and comparison testing.
+
+    ---
+    Original docstring:
+
+    Internal implementation: Score alignment and count edits with configurable MycoBLAST-style adjustments.
 
     Applies various preprocessing adjustments based on adjustment_params:
     - End trimming: Skip mismatches within end_skip_distance bp from either end (set 0 to disable)
@@ -1590,16 +1803,20 @@ def score_alignment(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_
     if scoring_format is None:
         scoring_format = DEFAULT_SCORING_FORMAT
 
+    # Single analysis pass - computes all metrics using unified logic
+    analysis = _unified_analysis(seq1_aligned, seq2_aligned, adjustment_params)
+
+    # Generate output based on adjust_gaps mode
     if adjust_gaps:
-        # Two-pass approach: analyze alignment, adjust gaps, then score
-        analysis = _analyze_alignment(seq1_aligned, seq2_aligned, adjustment_params)
-        seq1_adjusted, seq2_adjusted = _adjust_alignment_gaps(
-            seq1_aligned, seq2_aligned, analysis, adjustment_params
+        # Adjusted output: gap positions match scoring analysis
+        return _generate_adjusted_output(
+            seq1_aligned, seq2_aligned, analysis, adjustment_params, scoring_format
         )
-        return _score_alignment_impl(seq1_adjusted, seq2_adjusted, adjustment_params, scoring_format)
     else:
-        # Direct path: score original alignment (backward compatible)
-        return _score_alignment_impl(seq1_aligned, seq2_aligned, adjustment_params, scoring_format)
+        # Stuffed output: original alignment with stuffed scoring visualization
+        return _generate_stuffed_output(
+            seq1_aligned, seq2_aligned, analysis, adjustment_params, scoring_format
+        )
 
 
 def align_edlib_bidirectional(seq1, seq2):
