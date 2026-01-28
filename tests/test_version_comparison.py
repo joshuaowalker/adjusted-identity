@@ -32,8 +32,8 @@ from .compare_versions import (
 from adjusted_identity import DEFAULT_ADJUSTMENT_PARAMS, AdjustmentParams
 
 
-# Path to test data
-TEST_DATA_DIR = Path(__file__).parent
+# Path to test data (gitignored, not published)
+TEST_DATA_DIR = Path(__file__).parent / "data"
 SAMPLE_FASTA = TEST_DATA_DIR / "ONT10.82-B11-IN25-00187-iNat272809801-c1-RiC500-msa.fasta"
 
 

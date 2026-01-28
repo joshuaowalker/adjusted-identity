@@ -158,5 +158,8 @@ Desktop.ini
 .coverage.*
 htmlcov/
 
+# Local test data (not published)
+tests/data/
+
 # PDF references for development
 *.pdf

@@ -165,6 +165,66 @@ class AlleleAnalysis:
     is_pure_extension: bool
 
 
+@dataclass(frozen=True)
+class VariantRangeInfo:
+    """Information about a single variant range within an alignment.
+
+    Used by the gap adjustment algorithm to track variant range boundaries
+    and their allele analyses for reconstructing adjusted alignments.
+
+    Attributes:
+        start: Start position of variant range (inclusive)
+        end: End position of variant range (inclusive)
+        left_bound_pos: Position of left bounding match (-1 if none)
+        right_bound_pos: Position of right bounding match (-1 if none)
+        allele1: Non-gap content from seq1 in this range
+        allele2: Non-gap content from seq2 in this range
+        allele1_positions: Source positions for allele1 characters
+        allele2_positions: Source positions for allele2 characters
+        analysis1: AlleleAnalysis for allele1
+        analysis2: AlleleAnalysis for allele2
+        score_result: Scoring result dict from _score_variant_range
+    """
+    start: int
+    end: int
+    left_bound_pos: int
+    right_bound_pos: int
+    allele1: str
+    allele2: str
+    allele1_positions: tuple  # Use tuple for frozen dataclass (immutable)
+    allele2_positions: tuple
+    analysis1: AlleleAnalysis
+    analysis2: AlleleAnalysis
+    score_result: dict
+
+
+@dataclass(frozen=True)
+class AlignmentAnalysis:
+    """Complete analysis of an alignment for gap adjustment.
+
+    Contains all computed metrics and variant range information needed
+    to reconstruct an adjusted alignment where gaps match the scoring analysis.
+
+    Attributes:
+        identity: Calculated identity score (0.0-1.0)
+        mismatches: Number of edits/mismatches counted
+        scored_positions: Number of positions used for identity calculation
+        seq1_coverage: Fraction of seq1 used in alignment region
+        seq2_coverage: Fraction of seq2 used in alignment region
+        scoring_start: Start of scoring region (inclusive)
+        scoring_end: End of scoring region (inclusive)
+        variant_ranges: List of VariantRangeInfo for each variant range
+    """
+    identity: float
+    mismatches: int
+    scored_positions: int
+    seq1_coverage: float
+    seq2_coverage: float
+    scoring_start: int
+    scoring_end: int
+    variant_ranges: tuple  # Tuple of VariantRangeInfo for frozen dataclass
+
+
 # Default adjustment parameters (all adjustments enabled)
 DEFAULT_ADJUSTMENT_PARAMS = AdjustmentParams()
 
@@ -960,9 +1020,312 @@ def _generate_variant_score_string(seq1_aligned, seq2_aligned, start, end,
     return ''.join(score_chars)
 
 
-def score_alignment(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_format=None):
+def _analyze_alignment(seq1_aligned, seq2_aligned, adjustment_params=None):
     """
-    Score alignment and count edits with configurable MycoBLAST-style adjustments.
+    Analyze alignment to extract variant range information for gap adjustment.
+
+    This function performs the same analysis as _score_alignment_impl but returns
+    an AlignmentAnalysis object with detailed variant range information instead
+    of just the final AlignmentResult.
+
+    Args:
+        seq1_aligned (str): First sequence with gaps ('-') inserted
+        seq2_aligned (str): Second sequence with gaps ('-') inserted
+        adjustment_params (AdjustmentParams, optional): Parameters controlling analysis.
+                                                       Defaults to DEFAULT_ADJUSTMENT_PARAMS.
+
+    Returns:
+        AlignmentAnalysis: Analysis containing metrics and variant range information
+    """
+    if adjustment_params is None:
+        adjustment_params = DEFAULT_ADJUSTMENT_PARAMS
+
+    # Input validation
+    if len(seq1_aligned) != len(seq2_aligned):
+        raise ValueError(f"Aligned sequences must have same length: seq1={len(seq1_aligned)}, seq2={len(seq2_aligned)}")
+
+    total_alignment_length = len(seq1_aligned)
+    edits = 0
+    scored_positions = 0
+
+    # Calculate coverage (same as _score_alignment_impl)
+    seq1_coverage_positions = 0
+    seq2_coverage_positions = 0
+    seq1_total_length = 0
+    seq2_total_length = 0
+
+    # Find alignment bounds
+    alignment_start = 0
+    alignment_end = total_alignment_length - 1
+
+    for pos in range(total_alignment_length):
+        if seq1_aligned[pos] != '-' and seq2_aligned[pos] != '-':
+            alignment_start = pos
+            break
+
+    for pos in range(total_alignment_length - 1, -1, -1):
+        if seq1_aligned[pos] != '-' and seq2_aligned[pos] != '-':
+            alignment_end = pos
+            break
+
+    for pos in range(total_alignment_length):
+        if seq1_aligned[pos] != '-':
+            seq1_total_length += 1
+        if seq2_aligned[pos] != '-':
+            seq2_total_length += 1
+        if alignment_start <= pos <= alignment_end:
+            if seq1_aligned[pos] != '-':
+                seq1_coverage_positions += 1
+            if seq2_aligned[pos] != '-':
+                seq2_coverage_positions += 1
+
+    # Find scoring region
+    scoring_start, scoring_end = _find_scoring_region(
+        seq1_aligned, seq2_aligned, adjustment_params.end_skip_distance
+    )
+
+    # Find variant ranges
+    raw_variant_ranges = _find_variant_ranges(
+        seq1_aligned, seq2_aligned, scoring_start, scoring_end,
+        adjustment_params.handle_iupac_overlap
+    )
+
+    # Process variant ranges and collect detailed info
+    variant_range_infos = []
+
+    for vr_start, vr_end, left_bound, right_bound in raw_variant_ranges:
+        # Extract alleles
+        allele1, allele1_positions = _extract_allele(seq1_aligned, vr_start, vr_end)
+        allele2, allele2_positions = _extract_allele(seq2_aligned, vr_start, vr_end)
+
+        # Get context
+        max_ctx_len = adjustment_params.max_repeat_motif_length
+        left_context = None
+        right_context = None
+
+        if left_bound >= 0:
+            for ctx_len in range(max_ctx_len, 0, -1):
+                left_context = _extract_left_context(
+                    seq1_aligned, seq2_aligned, vr_start, ctx_len)
+                if left_context is not None:
+                    break
+
+        if right_bound >= 0:
+            for ctx_len in range(max_ctx_len, 0, -1):
+                right_context = _extract_right_context(
+                    seq1_aligned, seq2_aligned, vr_end, ctx_len)
+                if right_context is not None:
+                    break
+
+        # Analyze alleles
+        analysis1 = _analyze_allele(
+            allele1, left_context, right_context,
+            adjustment_params.max_repeat_motif_length,
+            adjustment_params.handle_iupac_overlap
+        )
+        analysis2 = _analyze_allele(
+            allele2, left_context, right_context,
+            adjustment_params.max_repeat_motif_length,
+            adjustment_params.handle_iupac_overlap
+        )
+
+        # Score the variant range
+        vr_score = _score_variant_range(
+            allele1, analysis1, allele2, analysis2, adjustment_params
+        )
+
+        edits += vr_score['edits']
+        scored_positions += vr_score['scored_positions']
+
+        # Create VariantRangeInfo
+        vr_info = VariantRangeInfo(
+            start=vr_start,
+            end=vr_end,
+            left_bound_pos=left_bound,
+            right_bound_pos=right_bound,
+            allele1=allele1,
+            allele2=allele2,
+            allele1_positions=tuple(allele1_positions),
+            allele2_positions=tuple(allele2_positions),
+            analysis1=analysis1,
+            analysis2=analysis2,
+            score_result=vr_score
+        )
+        variant_range_infos.append(vr_info)
+
+    # Count match positions (same logic as _score_alignment_impl)
+    pos = scoring_start
+    vr_index = 0
+    num_variant_ranges = len(raw_variant_ranges)
+
+    while pos <= scoring_end:
+        if vr_index < num_variant_ranges and pos == raw_variant_ranges[vr_index][0]:
+            # Skip variant range (already counted above)
+            pos = raw_variant_ranges[vr_index][1] + 1
+            vr_index += 1
+        else:
+            char1, char2 = seq1_aligned[pos], seq2_aligned[pos]
+            if char1 == '-' and char2 == '-':
+                # Dual-gap - not scored
+                pass
+            else:
+                scored_positions += 1
+            pos += 1
+
+    # Calculate coverage
+    seq1_coverage = seq1_coverage_positions / seq1_total_length if seq1_total_length > 0 else 0.0
+    seq2_coverage = seq2_coverage_positions / seq2_total_length if seq2_total_length > 0 else 0.0
+
+    # Calculate identity
+    identity = 1.0 - (edits / scored_positions) if scored_positions > 0 else 1.0
+
+    return AlignmentAnalysis(
+        identity=identity,
+        mismatches=edits,
+        scored_positions=scored_positions,
+        seq1_coverage=seq1_coverage,
+        seq2_coverage=seq2_coverage,
+        scoring_start=scoring_start,
+        scoring_end=scoring_end,
+        variant_ranges=tuple(variant_range_infos)
+    )
+
+
+def _adjust_variant_range(vr_info, adjustment_params):
+    """
+    Adjust a single variant range so gaps match the scoring analysis.
+
+    Uses middle-padded alignment:
+    - Left extensions: pad shorter with gaps at END (closest to core)
+    - Core: left-align, pad shorter with gaps at END
+    - Right extensions: pad shorter with gaps at START (closest to core)
+
+    Args:
+        vr_info: VariantRangeInfo with allele analyses
+        adjustment_params: AdjustmentParams for scoring behavior
+
+    Returns:
+        tuple: (adjusted_seq1_part, adjusted_seq2_part) strings for this variant range
+    """
+    analysis1 = vr_info.analysis1
+    analysis2 = vr_info.analysis2
+    allele1 = vr_info.allele1
+    allele2 = vr_info.allele2
+
+    # Extract extension and core portions
+    left1 = analysis1.left_extension_count
+    right1 = analysis1.right_extension_count
+    left2 = analysis2.left_extension_count
+    right2 = analysis2.right_extension_count
+
+    ext1_left = allele1[:left1] if left1 > 0 else ""
+    ext1_right = allele1[len(allele1) - right1:] if right1 > 0 else ""
+    core1 = analysis1.core_content
+
+    ext2_left = allele2[:left2] if left2 > 0 else ""
+    ext2_right = allele2[len(allele2) - right2:] if right2 > 0 else ""
+    core2 = analysis2.core_content
+
+    result_seq1 = []
+    result_seq2 = []
+
+    # Left extensions (middle-padded: gaps at END, closest to core)
+    max_left = max(len(ext1_left), len(ext2_left))
+    for i in range(max_left):
+        c1 = ext1_left[i] if i < len(ext1_left) else '-'
+        c2 = ext2_left[i] if i < len(ext2_left) else '-'
+        result_seq1.append(c1)
+        result_seq2.append(c2)
+
+    # Core content (left-aligned, shorter padded with gaps at end)
+    max_core = max(len(core1), len(core2))
+    for i in range(max_core):
+        c1 = core1[i] if i < len(core1) else '-'
+        c2 = core2[i] if i < len(core2) else '-'
+        result_seq1.append(c1)
+        result_seq2.append(c2)
+
+    # Right extensions (middle-padded: gaps at START, closest to core)
+    max_right = max(len(ext1_right), len(ext2_right))
+    pad1 = max_right - len(ext1_right)
+    pad2 = max_right - len(ext2_right)
+    for i in range(max_right):
+        c1 = '-' if i < pad1 else ext1_right[i - pad1]
+        c2 = '-' if i < pad2 else ext2_right[i - pad2]
+        result_seq1.append(c1)
+        result_seq2.append(c2)
+
+    return ''.join(result_seq1), ''.join(result_seq2)
+
+
+def _adjust_alignment_gaps(seq1_aligned, seq2_aligned, analysis, adjustment_params):
+    """
+    Adjust alignment so gap positions match the variant range scoring analysis.
+
+    This produces a "canonical" alignment where the scoring string is intuitive
+    to interpret position-by-position.
+
+    Algorithm:
+    1. For positions before scoring region: emit as-is (end-trimmed)
+    2. For positions in scoring region:
+       - Match positions: emit both characters as-is
+       - Dual-gap positions: emit both gaps as-is
+       - Variant range: emit adjusted variant range
+    3. For positions after scoring region: emit as-is (end-trimmed)
+
+    Args:
+        seq1_aligned, seq2_aligned: Original aligned sequences
+        analysis: AlignmentAnalysis from _analyze_alignment
+        adjustment_params: AdjustmentParams for scoring behavior
+
+    Returns:
+        tuple: (adjusted_seq1, adjusted_seq2) strings
+    """
+    result_seq1 = []
+    result_seq2 = []
+
+    # Build lookup for variant range start positions
+    vr_by_start = {vr.start: vr for vr in analysis.variant_ranges}
+    vr_ends = {vr.start: vr.end for vr in analysis.variant_ranges}
+
+    pos = 0
+    alignment_length = len(seq1_aligned)
+
+    while pos < alignment_length:
+        # Outside scoring region: emit as-is
+        if pos < analysis.scoring_start or pos > analysis.scoring_end:
+            result_seq1.append(seq1_aligned[pos])
+            result_seq2.append(seq2_aligned[pos])
+            pos += 1
+            continue
+
+        # Check if this position starts a variant range
+        if pos in vr_by_start:
+            vr_info = vr_by_start[pos]
+            vr_end = vr_ends[pos]
+
+            # Emit adjusted variant range
+            adj_seq1, adj_seq2 = _adjust_variant_range(vr_info, adjustment_params)
+            result_seq1.append(adj_seq1)
+            result_seq2.append(adj_seq2)
+
+            # Skip to end of variant range
+            pos = vr_end + 1
+            continue
+
+        # Match position or dual-gap: emit as-is
+        result_seq1.append(seq1_aligned[pos])
+        result_seq2.append(seq2_aligned[pos])
+        pos += 1
+
+    return ''.join(result_seq1), ''.join(result_seq2)
+
+
+def _score_alignment_impl(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_format=None):
+    """
+    Internal implementation: Score alignment and count edits with configurable MycoBLAST-style adjustments.
+
+    This is the internal implementation. Use score_alignment() for the public API.
 
     Applies various preprocessing adjustments based on adjustment_params:
     - End trimming: Skip mismatches within end_skip_distance bp from either end (set 0 to disable)
@@ -1182,6 +1545,63 @@ def score_alignment(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_
     )
 
 
+def score_alignment(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_format=None,
+                    adjust_gaps=False):
+    """
+    Score alignment and count edits with configurable MycoBLAST-style adjustments.
+
+    Applies various preprocessing adjustments based on adjustment_params:
+    - End trimming: Skip mismatches within end_skip_distance bp from either end (set 0 to disable)
+    - Homopolymer adjustment: Ignore differences in homopolymer run lengths
+    - IUPAC handling: Allow different ambiguity codes to match via intersection
+    - Indel normalization: Count contiguous indels as single evolutionary events
+
+    Args:
+        seq1_aligned (str): First sequence with gaps ('-') inserted
+        seq2_aligned (str): Second sequence with gaps ('-') inserted
+        adjustment_params (AdjustmentParams, optional): Parameters controlling which adjustments to apply.
+                                                       Defaults to DEFAULT_ADJUSTMENT_PARAMS.
+        scoring_format (ScoringFormat, optional): Format codes for alignment visualization.
+                                                 Defaults to DEFAULT_SCORING_FORMAT.
+        adjust_gaps (bool): If True, rewrite alignment so gap positions match the
+                           scoring analysis. Output *_aligned strings may have different
+                           length than input. Defaults to False for backward compatibility.
+
+    Returns:
+        AlignmentResult: Dataclass containing:
+            - identity (float): Identity score based on adjustment parameters
+            - mismatches (int): Number of mismatches/edits counted
+            - scored_positions (int): Number of positions used for identity calculation
+            - seq1_coverage (float): Fraction of seq1 used in scoring region
+            - seq2_coverage (float): Fraction of seq2 used in scoring region
+            - seq1_aligned (str): Input seq1_aligned (or adjusted if adjust_gaps=True)
+            - seq2_aligned (str): Input seq2_aligned (or adjusted if adjust_gaps=True)
+            - score_aligned (str): Scoring codes string for visualization
+
+    Note:
+        When adjust_gaps=True, the output aligned sequences may have different length
+        than the input because variant ranges are rewritten to match the scoring analysis.
+        The identity metrics will be identical whether adjust_gaps is True or False,
+        but the visualization will be more intuitive with adjust_gaps=True.
+    """
+    # Use default parameters if none provided
+    if adjustment_params is None:
+        adjustment_params = DEFAULT_ADJUSTMENT_PARAMS
+    if scoring_format is None:
+        scoring_format = DEFAULT_SCORING_FORMAT
+
+    if adjust_gaps:
+        # Two-pass approach: analyze alignment, adjust gaps, then score
+        analysis = _analyze_alignment(seq1_aligned, seq2_aligned, adjustment_params)
+        seq1_adjusted, seq2_adjusted = _adjust_alignment_gaps(
+            seq1_aligned, seq2_aligned, analysis, adjustment_params
+        )
+        return _score_alignment_impl(seq1_adjusted, seq2_adjusted, adjustment_params, scoring_format)
+    else:
+        # Direct path: score original alignment (backward compatible)
+        return _score_alignment_impl(seq1_aligned, seq2_aligned, adjustment_params, scoring_format)
+
+
 def align_edlib_bidirectional(seq1, seq2):
     """
     Multi-stage alignment optimization using CIGAR-based suffix detection.
@@ -1285,7 +1705,7 @@ def align_edlib_bidirectional(seq1, seq2):
     return final_alignment
 
 
-def align_and_score(seq1, seq2, adjustment_params=None, scoring_format=None):
+def align_and_score(seq1, seq2, adjustment_params=None, scoring_format=None, adjust_gaps=False):
     """
     Calculate adjusted and full identity between two DNA sequences.
 
@@ -1305,6 +1725,9 @@ def align_and_score(seq1, seq2, adjustment_params=None, scoring_format=None):
                                                        Defaults to DEFAULT_ADJUSTMENT_PARAMS.
         scoring_format (ScoringFormat, optional): Format codes for alignment visualization.
                                                  Defaults to DEFAULT_SCORING_FORMAT.
+        adjust_gaps (bool): If True, rewrite alignment so gap positions match the
+                           scoring analysis. Output *_aligned strings may have different
+                           length than input. Defaults to False for backward compatibility.
 
     Returns:
         AlignmentResult: Dataclass containing:
@@ -1313,8 +1736,8 @@ def align_and_score(seq1, seq2, adjustment_params=None, scoring_format=None):
             - scored_positions (int): Number of positions used for identity calculation
             - seq1_coverage (float): Fraction of seq1 used in scoring region
             - seq2_coverage (float): Fraction of seq2 used in scoring region
-            - seq1_aligned (str): First aligned sequence with gaps
-            - seq2_aligned (str): Second aligned sequence with gaps
+            - seq1_aligned (str): First aligned sequence with gaps (or adjusted if adjust_gaps=True)
+            - seq2_aligned (str): Second aligned sequence with gaps (or adjusted if adjust_gaps=True)
             - score_aligned (str): Scoring codes string for visualization
 
     Example:
@@ -1328,7 +1751,7 @@ def align_and_score(seq1, seq2, adjustment_params=None, scoring_format=None):
         adjustment_params = DEFAULT_ADJUSTMENT_PARAMS
     if scoring_format is None:
         scoring_format = DEFAULT_SCORING_FORMAT
-    
+
     # Safety check: ensure sequences are non-empty
     if len(seq1) == 0 or len(seq2) == 0:
         return AlignmentResult(
@@ -1369,6 +1792,6 @@ def align_and_score(seq1, seq2, adjustment_params=None, scoring_format=None):
     # Score the alignment and calculate identity metrics
     # score_alignment now calculates everything including identity values
     return score_alignment(
-        seq1_aligned, seq2_aligned, adjustment_params, scoring_format
+        seq1_aligned, seq2_aligned, adjustment_params, scoring_format, adjust_gaps
     )
 
