@@ -1217,18 +1217,24 @@ def _adjust_variant_range(vr_info, adjustment_params):
     allele2 = vr_info.allele2
 
     # Extract extension and core portions
-    left1 = analysis1.left_extension_count
-    right1 = analysis1.right_extension_count
-    left2 = analysis2.left_extension_count
-    right2 = analysis2.right_extension_count
+    # When homopolymer normalization is disabled, treat all content as core
+    # (extensions only affect scoring when normalization is enabled, so gap
+    # adjustment should not rewrite positions based on unrecognized extensions)
+    if adjustment_params.normalize_homopolymers:
+        left1 = analysis1.left_extension_count
+        right1 = analysis1.right_extension_count
+        left2 = analysis2.left_extension_count
+        right2 = analysis2.right_extension_count
+    else:
+        left1 = right1 = left2 = right2 = 0
 
     ext1_left = allele1[:left1] if left1 > 0 else ""
     ext1_right = allele1[len(allele1) - right1:] if right1 > 0 else ""
-    core1 = analysis1.core_content
+    core1 = analysis1.core_content if adjustment_params.normalize_homopolymers else allele1
 
     ext2_left = allele2[:left2] if left2 > 0 else ""
     ext2_right = allele2[len(allele2) - right2:] if right2 > 0 else ""
-    core2 = analysis2.core_content
+    core2 = analysis2.core_content if adjustment_params.normalize_homopolymers else allele2
 
     result_seq1 = []
     result_seq2 = []

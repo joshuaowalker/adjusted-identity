@@ -45,6 +45,16 @@ class TestMetricsPreservation:
         ("AAA-X-GGG", "AAAYY-GGG"),
         # Simple indel in middle of sequence
         ("ATCG-ATCG", "ATCGAATCG"),
+        # Dinucleotide repeat: basic AT extension
+        ("CGATAT--C", "CGATATATC"),
+        # Dinucleotide repeat: multiple AT units
+        ("CGATAT----C", "CGATATATATC"),
+        # Dinucleotide repeat: both sides
+        ("ATAT------ATAT", "ATATATATATATAT"),
+        # Dinucleotide repeat: partial motif (has core mismatch)
+        ("ATAT---C", "ATATATAC"),
+        # Dinucleotide repeat: mixed motif lengths (AT repeat + G homopolymer)
+        ("ATAT----GGG", "ATATATCGGGG"),
     ])
     def test_identity_metrics_identical(self, seq1, seq2):
         """Identity value should be identical with or without gap adjustment.
@@ -65,6 +75,10 @@ class TestMetricsPreservation:
         ("AAAA-TT", "AAA--TT"),
         ("TGC-C-TC", "TGCT--TC"),
         ("AAA-X-GGG", "AAAYY-GGG"),
+        # Dinucleotide repeat: basic AT extension
+        ("CGATAT--C", "CGATATATC"),
+        # Dinucleotide repeat: partial motif (has core mismatch)
+        ("ATAT---C", "ATATATAC"),
     ])
     def test_mismatches_identical(self, seq1, seq2):
         """Mismatch count should be identical with or without gap adjustment."""
@@ -78,6 +92,8 @@ class TestMetricsPreservation:
         ("ATCG", "ATCG"),
         ("AAAA-TT", "AAA--TT"),
         ("TGC-C-TC", "TGCT--TC"),
+        # Dinucleotide repeat
+        ("CGATAT--C", "CGATATATC"),
     ])
     def test_coverage_identical(self, seq1, seq2):
         """Coverage values should be identical with or without gap adjustment."""
@@ -504,3 +520,343 @@ class TestRealWorldScenarios:
         assert result_normal.mismatches == 1
         # Identity should be ~91.67% (11/12 scored positions)
         assert result_normal.identity == pytest.approx(11/12, rel=1e-4)
+
+
+class TestDinucleotideGapAdjustment:
+    """Test adjust_gaps=True with dinucleotide repeat motifs (motif length 2).
+
+    These tests verify that gap adjustment works correctly with repeat
+    extensions longer than homopolymers, using max_repeat_motif_length=2.
+    """
+
+    def test_basic_at_repeat_extension_markers(self):
+        """AT repeat extension should show '=' markers in adjusted output."""
+        params = AdjustmentParams(max_repeat_motif_length=2)
+        result = score_alignment("CGATAT--C", "CGATATATC", params, adjust_gaps=True)
+
+        assert result.identity == 1.0
+        assert result.mismatches == 0
+        assert result.score_aligned.count('=') == 2
+
+    def test_basic_at_repeat_preserves_content(self):
+        """Adjusted output must preserve biological content for AT repeat."""
+        params = AdjustmentParams(max_repeat_motif_length=2)
+        result = score_alignment("CGATAT--C", "CGATATATC", params, adjust_gaps=True)
+
+        assert result.seq1_aligned.replace('-', '') == "CGATATC"
+        assert result.seq2_aligned.replace('-', '') == "CGATATATC"
+
+    def test_multiple_at_units_extension_count(self):
+        """Two extra AT units should produce 4 extension markers."""
+        params = AdjustmentParams(max_repeat_motif_length=2)
+        result = score_alignment("CGATAT----C", "CGATATATATC", params, adjust_gaps=True)
+
+        assert result.identity == 1.0
+        assert result.mismatches == 0
+        assert result.score_aligned.count('=') == 4
+
+    def test_both_sides_at_repeat(self):
+        """AT repeat on both sides of indel should produce 6 extension markers."""
+        params = AdjustmentParams(max_repeat_motif_length=2)
+        result = score_alignment(
+            "ATAT------ATAT", "ATATATATATATAT", params, adjust_gaps=True
+        )
+
+        assert result.identity == 1.0
+        assert result.mismatches == 0
+        assert result.score_aligned.count('=') == 6
+
+    def test_reverse_complement_motifs(self):
+        """AT on left and TA on right should both be recognized as extensions."""
+        params = AdjustmentParams(max_repeat_motif_length=2)
+        result = score_alignment("ATAT--TATA", "ATATATTATA", params, adjust_gaps=True)
+
+        assert result.identity == 1.0
+        assert result.mismatches == 0
+        assert result.score_aligned.count('=') == 2
+
+    def test_partial_motif_metrics(self):
+        """Partial motif (ATA where motif is AT) should count as 1 mismatch."""
+        params = AdjustmentParams(max_repeat_motif_length=2)
+        result = score_alignment("ATAT---C", "ATATATAC", params, adjust_gaps=True)
+
+        assert result.mismatches == 1
+        assert result.scored_positions == 6
+        assert result.identity == pytest.approx(5 / 6, rel=1e-6)
+
+    def test_partial_motif_has_extensions(self):
+        """Partial motif case should still show extension markers for the full AT unit."""
+        params = AdjustmentParams(max_repeat_motif_length=2)
+        result = score_alignment("ATAT---C", "ATATATAC", params, adjust_gaps=True)
+
+        assert result.score_aligned.count('=') >= 2
+
+    def test_mixed_at_repeat_and_homopolymer(self):
+        """AT repeat extension + core mismatch + G homopolymer extension."""
+        params = AdjustmentParams(max_repeat_motif_length=2)
+        result = score_alignment("ATAT----GGG", "ATATATCGGGG", params, adjust_gaps=True)
+
+        # One mismatch from the C core
+        assert result.mismatches == 1
+        assert result.identity == pytest.approx(7 / 8, rel=1e-6)
+        # Should have extension markers for AT repeat and G homopolymer
+        assert result.score_aligned.count('=') >= 3
+
+    def test_extension_positions_have_one_gap(self):
+        """Each extension marker in adjusted output should pair a nucleotide with a gap."""
+        params = AdjustmentParams(max_repeat_motif_length=2)
+        result = score_alignment("CGATAT--C", "CGATATATC", params, adjust_gaps=True)
+
+        for i, marker in enumerate(result.score_aligned):
+            if marker == '=':
+                c1, c2 = result.seq1_aligned[i], result.seq2_aligned[i]
+                gaps = (c1 == '-') + (c2 == '-')
+                assert gaps == 1, \
+                    f"Position {i}: extension marker should have 1 gap, got {gaps} ({c1}/{c2})"
+
+    def test_adjusted_components_same_length(self):
+        """seq1_aligned, seq2_aligned, and score_aligned must have equal length."""
+        params = AdjustmentParams(max_repeat_motif_length=2)
+        cases = [
+            ("CGATAT--C", "CGATATATC"),
+            ("ATAT------ATAT", "ATATATATATATAT"),
+            ("ATAT---C", "ATATATAC"),
+        ]
+
+        for seq1, seq2 in cases:
+            result = score_alignment(seq1, seq2, params, adjust_gaps=True)
+            assert len(result.seq1_aligned) == len(result.seq2_aligned) == len(result.score_aligned), \
+                f"Length mismatch for {seq1} vs {seq2}"
+
+    def test_annotated_vs_adjusted_score_strings_differ_for_mixed_case(self):
+        """Adjusted score string should differ from annotated for mixed indels.
+
+        When a variant range has both extensions and core content, the annotated
+        output (adjust_gaps=False) shows the core as a mismatch marker while the
+        adjusted output (adjust_gaps=True) rewrites gap positions so each position
+        is individually interpretable.
+        """
+        params = AdjustmentParams(max_repeat_motif_length=2)
+        result_false = score_alignment("ATAT----GGG", "ATATATCGGGG", params, adjust_gaps=False)
+        result_true = score_alignment("ATAT----GGG", "ATATATCGGGG", params, adjust_gaps=True)
+
+        # Metrics must be identical
+        assert result_false.identity == result_true.identity
+        assert result_false.mismatches == result_true.mismatches
+
+        # But score strings differ: annotated has ' ' and '-' for indel positions,
+        # adjusted rewrites them so each position has a clear interpretation
+        assert result_false.score_aligned != result_true.score_aligned
+
+    def test_align_and_score_dinucleotide(self):
+        """align_and_score should handle dinucleotide repeats with adjust_gaps=True."""
+        params = AdjustmentParams(max_repeat_motif_length=2)
+
+        result_false = align_and_score("CGATATATC", "CGATATC", params, adjust_gaps=False)
+        result_true = align_and_score("CGATATATC", "CGATATC", params, adjust_gaps=True)
+
+        assert result_false.identity == result_true.identity
+        assert result_false.mismatches == result_true.mismatches
+        assert result_true.identity == 1.0
+        assert result_true.mismatches == 0
+
+        # Biological content preserved
+        assert result_true.seq1_aligned.replace('-', '') == "CGATATATC"
+        assert result_true.seq2_aligned.replace('-', '') == "CGATATC"
+
+    def test_dinucleotide_not_detected_with_motif_length_1(self):
+        """Setting max_repeat_motif_length=1 should disable dinucleotide detection.
+
+        With adjust_gaps=True, the AT insertion should be treated as a regular
+        indel rather than a repeat extension.
+        """
+        params = AdjustmentParams(max_repeat_motif_length=1)
+        result = score_alignment("ATAT--C", "ATATATC", params, adjust_gaps=True)
+
+        # AT not recognized as repeat, so it's a regular indel = mismatch
+        assert result.mismatches > 0
+        assert result.identity < 1.0
+
+    def test_floating_ungapped_extensions_separated(self):
+        """Gaps introduced in ungapped input to reveal extension interpretation.
+
+        Input: equal-length sequences with no gaps.
+          seq1: GGGGATATCCCC  (4G + AT + AT + 4C)
+          seq2: GGGGATCCCCCC  (4G + AT + 6C)
+
+        The scoring engine recognizes the AT/CC difference as two extensions:
+        seq1's extra AT extends the GGGGATAT dinucleotide context, and seq2's
+        extra CC extends the CCCC homopolymer context.
+
+        With adjust_gaps=True, gaps are introduced to separate the two
+        extensions into individually visible positions.
+        """
+        params = AdjustmentParams(max_repeat_motif_length=2)
+        seq1 = "GGGGATATCCCC"
+        seq2 = "GGGGATCCCCCC"
+
+        result_false = score_alignment(seq1, seq2, params, adjust_gaps=False)
+        result_true = score_alignment(seq1, seq2, params, adjust_gaps=True)
+
+        # Both are pure extensions: identity=1.0
+        assert result_false.identity == result_true.identity == 1.0
+        assert result_false.mismatches == result_true.mismatches == 0
+
+        # Annotated output: no gaps, extensions marked in place
+        assert result_false.seq1_aligned == "GGGGATATCCCC"
+        assert result_false.seq2_aligned == "GGGGATCCCCCC"
+        assert result_false.score_aligned == "||||||==||||"
+
+        # Adjusted output: gaps introduced to separate extensions
+        assert result_true.seq1_aligned == "GGGGATAT--CCCC"
+        assert result_true.seq2_aligned == "GGGGAT--CCCCCC"
+        assert result_true.score_aligned == "||||||====||||"
+
+        # Biological content preserved
+        assert result_true.seq1_aligned.replace('-', '') == seq1
+        assert result_true.seq2_aligned.replace('-', '') == seq2
+
+    def test_floating_trailing_extension_becomes_visible(self):
+        """Trailing extension floats from end-trimmed to scored with adjust_gaps=True.
+
+        Input alignment: GGGGATATCCCC-- vs GGGGAT--CCCCCC
+        The AT in seq1 is a dinucleotide extension (extends GGGGATAT context).
+        The trailing CC in seq2 is a homopolymer extension (extends CCCC context).
+
+        With adjust_gaps=False, the trailing CC is end-trimmed (marked '.').
+        With adjust_gaps=True, it is recognized as an extension (marked '=').
+        """
+        params = AdjustmentParams(max_repeat_motif_length=2)
+        seq1 = "GGGGATATCCCC--"
+        seq2 = "GGGGAT--CCCCCC"
+
+        result_false = score_alignment(seq1, seq2, params, adjust_gaps=False)
+        result_true = score_alignment(seq1, seq2, params, adjust_gaps=True)
+
+        # Metrics identical: both are pure extensions
+        assert result_false.identity == result_true.identity == 1.0
+        assert result_false.mismatches == result_true.mismatches == 0
+
+        # Annotated output: trailing CC marked as end-trimmed
+        assert result_false.score_aligned == "||||||==||||.."
+
+        # Adjusted output: trailing CC recognized as extensions
+        assert result_true.score_aligned == "||||||==||||=="
+
+    def test_floating_interleaved_gaps_consolidated(self):
+        """Interleaved gaps are consolidated to contiguous positions.
+
+        Input alignment has AT extension scattered with gaps:
+          seq1: GGGGAT-AT-CCCC--
+          seq2: GGGGAT----CCCCCC
+
+        With adjust_gaps=True, gaps consolidate so each extension is contiguous:
+          seq1: GGGGATATCCCC--
+          seq2: GGGGAT--CCCCCC
+        """
+        params = AdjustmentParams(max_repeat_motif_length=2)
+        seq1 = "GGGGAT-AT-CCCC--"
+        seq2 = "GGGGAT----CCCCCC"
+
+        result_false = score_alignment(seq1, seq2, params, adjust_gaps=False)
+        result_true = score_alignment(seq1, seq2, params, adjust_gaps=True)
+
+        # Metrics identical
+        assert result_false.identity == result_true.identity == 1.0
+        assert result_false.mismatches == result_true.mismatches == 0
+
+        # Adjusted output consolidates gaps
+        assert result_true.seq1_aligned == "GGGGATATCCCC--"
+        assert result_true.seq2_aligned == "GGGGAT--CCCCCC"
+        assert result_true.score_aligned == "||||||==||||=="
+
+        # Annotated output preserves original scattered gaps
+        assert result_false.seq1_aligned == seq1
+        assert result_false.seq2_aligned == seq2
+
+        # Biological content preserved through consolidation
+        assert result_true.seq1_aligned.replace('-', '') == seq1.replace('-', '')
+        assert result_true.seq2_aligned.replace('-', '') == seq2.replace('-', '')
+
+
+class TestNormalizationDisabledGapAdjustment:
+    """Test adjust_gaps=True when normalize_homopolymers=False.
+
+    When homopolymer normalization is disabled, extension detection should be
+    skipped entirely. This ensures the gap adjustment code doesn't rewrite
+    gap positions based on extensions that the scoring engine ignores.
+    """
+
+    def test_ungapped_equal_length_no_gaps_introduced(self):
+        """Ungapped equal-length sequences should not have gaps introduced.
+
+        AAAATTT vs AAATTTT: with normalization off, this is a substitution
+        at position 4 (A vs T). No gaps should be introduced.
+        """
+        params = AdjustmentParams(normalize_homopolymers=False)
+        result = score_alignment("AAAATTT", "AAATTTT", params, adjust_gaps=True)
+
+        # No gaps should be introduced
+        assert '-' not in result.seq1_aligned, \
+            f"Unexpected gaps in seq1: {result.seq1_aligned}"
+        assert '-' not in result.seq2_aligned, \
+            f"Unexpected gaps in seq2: {result.seq2_aligned}"
+
+        # Should show as 1 mismatch (substitution)
+        assert result.mismatches == 1
+        assert result.seq1_aligned == "AAAATTT"
+        assert result.seq2_aligned == "AAATTTT"
+
+    def test_gapped_homopolymer_no_extension_markers(self):
+        """Gapped homopolymer should not show extension markers when normalization off.
+
+        AAAA-TT vs AAA--TT: gap rewriting still happens (variant range core
+        content is realigned), but no '=' extension markers should appear.
+        """
+        params = AdjustmentParams(normalize_homopolymers=False)
+        result = score_alignment("AAAA-TT", "AAA--TT", params, adjust_gaps=True)
+
+        # No extension markers should appear
+        assert '=' not in result.score_aligned, \
+            f"Unexpected extension markers in score: {result.score_aligned}"
+
+    def test_dinucleotide_treated_as_regular_indel(self):
+        """Dinucleotide insertion treated as regular indel when normalization off.
+
+        CGATAT--C vs CGATATATC: the AT insertion should not be recognized
+        as a repeat extension.
+        """
+        params = AdjustmentParams(
+            normalize_homopolymers=False, max_repeat_motif_length=2
+        )
+        result = score_alignment("CGATAT--C", "CGATATATC", params, adjust_gaps=True)
+
+        # No extension markers should appear
+        assert '=' not in result.score_aligned, \
+            f"Unexpected extension markers in score: {result.score_aligned}"
+
+        # AT insertion is a regular indel, not an extension
+        assert result.identity < 1.0
+
+    def test_ungapped_dinucleotide_no_gaps_introduced(self):
+        """Ungapped dinucleotide case should not have gaps introduced.
+
+        GGGGATATCCCC vs GGGGATCCCCCC: with normalization off, no extensions
+        are detected and no gaps should be introduced.
+        """
+        params = AdjustmentParams(
+            normalize_homopolymers=False, max_repeat_motif_length=2
+        )
+        seq1 = "GGGGATATCCCC"
+        seq2 = "GGGGATCCCCCC"
+        result = score_alignment(seq1, seq2, params, adjust_gaps=True)
+
+        # No gaps introduced
+        assert result.seq1_aligned == seq1, \
+            f"Unexpected change in seq1: {result.seq1_aligned}"
+        assert result.seq2_aligned == seq2, \
+            f"Unexpected change in seq2: {result.seq2_aligned}"
+
+        # No extension markers
+        assert '=' not in result.score_aligned, \
+            f"Unexpected extension markers in score: {result.score_aligned}"
