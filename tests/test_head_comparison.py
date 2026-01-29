@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Tests comparing origin/main (pre-adjust_gaps) with HEAD (with adjust_gaps).
+Tests comparing v0.2.4 baseline (pre-adjust_gaps) with HEAD (with adjust_gaps).
 
 Two test categories:
-A) adjust_gaps=False: Results should be IDENTICAL to origin/main
+A) adjust_gaps=False: Results should be IDENTICAL to v0.2.4
 B) adjust_gaps=True: Metrics may differ due to gap rewriting changing alignment interpretation
 
 These tests verify that adding the adjust_gaps parameter doesn't change
 existing behavior when adjust_gaps=False (the default).
 
-NOTE: These tests require git access to origin/main and are skipped in CI.
+NOTE: These tests require the v0.2.4 git tag and are skipped in CI.
 """
 
 import os
@@ -19,7 +19,7 @@ from pathlib import Path
 # Skip all tests in this module when running in CI (no git origin access)
 pytestmark = pytest.mark.skipif(
     os.environ.get("CI") == "true",
-    reason="HEAD comparison tests require git origin/main access (skipped in CI)"
+    reason="HEAD comparison tests require v0.2.4 git tag (skipped in CI)"
 )
 
 from .compare_versions import (
@@ -41,7 +41,7 @@ class TestHeadComparisonInfrastructure:
     """Tests for the HEAD comparison infrastructure itself."""
 
     def test_origin_loader_works(self):
-        """Verify we can load the origin/main scorer."""
+        """Verify we can load the v0.2.4 baseline scorer."""
         scorer = load_origin_scorer()
         assert callable(scorer)
 
@@ -62,10 +62,10 @@ class TestHeadComparisonInfrastructure:
 
 class TestAdjustGapsFalseIdentical:
     """
-    Verify HEAD with adjust_gaps=False produces identical results to origin/main.
+    Verify HEAD with adjust_gaps=False produces identical results to v0.2.4.
 
     When the new code runs with adjust_gaps=False (default), it should produce
-    byte-for-byte identical results to origin/main. This verifies zero behavioral
+    byte-for-byte identical results to v0.2.4. This verifies zero behavioral
     change for the default path.
     """
 
@@ -153,7 +153,7 @@ class TestAdjustGapsFalseIdentical:
 
 class TestAdjustGapsTrueMetrics:
     """
-    Test HEAD with adjust_gaps=True behavior.
+    Test HEAD with adjust_gaps=True behavior against v0.2.4 baseline.
 
     With the unified architecture, adjust_gaps=True and adjust_gaps=False
     now produce IDENTICAL metrics. The aligned strings differ (that's the
