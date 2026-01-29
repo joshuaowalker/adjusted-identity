@@ -35,7 +35,7 @@ class TestPureExtensionCases:
         result_true = score_alignment(seq1, seq2, adjust_gaps=True)
 
         # Document unified behavior:
-        # Both adjust_gaps modes use the same _unified_analysis pass
+        # Both adjust_gaps modes use the same _analyze_alignment pass
         # Only the output strings differ
 
         # Both should have identity=1.0 (homopolymer difference ignored)
@@ -209,7 +209,7 @@ class TestMetricValuesSnapshot:
     Snapshot of exact metric values for key test cases with unified architecture.
 
     Both adjust_gaps=True and adjust_gaps=False produce identical metrics
-    using the single _unified_analysis pass.
+    using the single _analyze_alignment pass.
     """
 
     def test_snapshot_homopolymer_extension(self):

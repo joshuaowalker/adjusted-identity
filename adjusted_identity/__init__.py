@@ -1020,7 +1020,7 @@ def _generate_variant_score_string(seq1_aligned, seq2_aligned, start, end,
     return ''.join(score_chars)
 
 
-def _unified_analysis(seq1_aligned, seq2_aligned, adjustment_params=None):
+def _analyze_alignment(seq1_aligned, seq2_aligned, adjustment_params=None):
     """
     Unified analysis of alignment extracting variant range information and computing metrics.
 
@@ -1029,7 +1029,7 @@ def _unified_analysis(seq1_aligned, seq2_aligned, adjustment_params=None):
     regardless of output mode.
 
     Returns an AlignmentAnalysis object with all computed metrics and detailed
-    variant range information needed to generate either "stuffed" or "adjusted"
+    variant range information needed to generate either "annotated" or "adjusted"
     output alignments.
 
     Args:
@@ -1279,7 +1279,7 @@ def _adjust_alignment_gaps(seq1_aligned, seq2_aligned, analysis, adjustment_para
 
     Args:
         seq1_aligned, seq2_aligned: Original aligned sequences
-        analysis: AlignmentAnalysis from _unified_analysis
+        analysis: AlignmentAnalysis from _analyze_alignment
         adjustment_params: AdjustmentParams for scoring behavior
 
     Returns:
@@ -1325,17 +1325,17 @@ def _adjust_alignment_gaps(seq1_aligned, seq2_aligned, analysis, adjustment_para
     return ''.join(result_seq1), ''.join(result_seq2)
 
 
-def _generate_stuffed_score_string(seq1_aligned, seq2_aligned, analysis, adjustment_params, scoring_format):
+def _generate_annotated_score_string(seq1_aligned, seq2_aligned, analysis, adjustment_params, scoring_format):
     """
-    Generate "stuffed" score string for original alignment (adjust_gaps=False).
+    Generate "annotated" score string for original alignment (adjust_gaps=False).
 
-    This generates a scoring visualization where gap positions are "stuffed" with
+    This generates a scoring visualization where gap positions are "annotated" with
     markers based on the variant range analysis. The visualization reflects how
     positions were scored using the unified analysis.
 
     Args:
         seq1_aligned, seq2_aligned: Original aligned sequences (unchanged)
-        analysis: AlignmentAnalysis from _unified_analysis
+        analysis: AlignmentAnalysis from _analyze_alignment
         adjustment_params: AdjustmentParams for scoring behavior
         scoring_format: ScoringFormat for visualization
 
@@ -1394,7 +1394,7 @@ def _generate_stuffed_score_string(seq1_aligned, seq2_aligned, analysis, adjustm
     return ''.join(score_chars)
 
 
-def _generate_stuffed_output(seq1_aligned, seq2_aligned, analysis, adjustment_params, scoring_format):
+def _generate_annotated_output(seq1_aligned, seq2_aligned, analysis, adjustment_params, scoring_format):
     """
     Generate AlignmentResult for adjust_gaps=False using original alignment strings.
 
@@ -1403,14 +1403,14 @@ def _generate_stuffed_output(seq1_aligned, seq2_aligned, analysis, adjustment_pa
 
     Args:
         seq1_aligned, seq2_aligned: Original aligned sequences
-        analysis: AlignmentAnalysis from _unified_analysis
+        analysis: AlignmentAnalysis from _analyze_alignment
         adjustment_params: AdjustmentParams for scoring behavior
         scoring_format: ScoringFormat for visualization
 
     Returns:
-        AlignmentResult: Result with original alignment strings and stuffed score string
+        AlignmentResult: Result with original alignment strings and annotated score string
     """
-    score_aligned = _generate_stuffed_score_string(
+    score_aligned = _generate_annotated_score_string(
         seq1_aligned, seq2_aligned, analysis, adjustment_params, scoring_format
     )
 
@@ -1439,7 +1439,7 @@ def _generate_adjusted_score_string(adj_seq1, adj_seq2, analysis, adjustment_par
 
     Args:
         adj_seq1, adj_seq2: Gap-adjusted aligned sequences
-        analysis: AlignmentAnalysis from _unified_analysis
+        analysis: AlignmentAnalysis from _analyze_alignment
         adjustment_params: AdjustmentParams for scoring behavior
         scoring_format: ScoringFormat for visualization
 
@@ -1496,7 +1496,7 @@ def _generate_adjusted_output(seq1_aligned, seq2_aligned, analysis, adjustment_p
 
     Args:
         seq1_aligned, seq2_aligned: Original aligned sequences
-        analysis: AlignmentAnalysis from _unified_analysis
+        analysis: AlignmentAnalysis from _analyze_alignment
         adjustment_params: AdjustmentParams for scoring behavior
         scoring_format: ScoringFormat for visualization
 
@@ -1571,7 +1571,7 @@ def score_alignment(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_
         scoring_format = DEFAULT_SCORING_FORMAT
 
     # Single analysis pass - computes all metrics using unified logic
-    analysis = _unified_analysis(seq1_aligned, seq2_aligned, adjustment_params)
+    analysis = _analyze_alignment(seq1_aligned, seq2_aligned, adjustment_params)
 
     # Generate output based on adjust_gaps mode
     if adjust_gaps:
@@ -1580,8 +1580,8 @@ def score_alignment(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_
             seq1_aligned, seq2_aligned, analysis, adjustment_params, scoring_format
         )
     else:
-        # Stuffed output: original alignment with stuffed scoring visualization
-        return _generate_stuffed_output(
+        # Stuffed output: original alignment with annotated scoring visualization
+        return _generate_annotated_output(
             seq1_aligned, seq2_aligned, analysis, adjustment_params, scoring_format
         )
 

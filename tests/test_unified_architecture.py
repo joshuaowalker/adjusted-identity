@@ -14,7 +14,7 @@ from adjusted_identity import (
     DEFAULT_ADJUSTMENT_PARAMS,
     RAW_ADJUSTMENT_PARAMS,
     AdjustmentParams,
-    _unified_analysis,
+    _analyze_alignment,
 )
 
 
@@ -97,7 +97,7 @@ class TestUnifiedMetrics:
 class TestOutputDifferences:
     """Verify that output strings differ as expected between modes."""
 
-    def test_stuffed_output_preserves_alignment(self):
+    def test_annotated_output_preserves_alignment(self):
         """adjust_gaps=False should return original alignment strings."""
         seq1 = "AAAA-TT"
         seq2 = "AAA--TT"
@@ -145,14 +145,14 @@ class TestOutputDifferences:
 
 
 class TestUnifiedAnalysisFunction:
-    """Test the _unified_analysis function directly."""
+    """Test the _analyze_alignment function directly."""
 
     def test_analysis_returns_correct_structure(self):
-        """_unified_analysis should return AlignmentAnalysis with all fields."""
+        """_analyze_alignment should return AlignmentAnalysis with all fields."""
         seq1 = "AAAA-TT"
         seq2 = "AAA--TT"
 
-        analysis = _unified_analysis(seq1, seq2, DEFAULT_ADJUSTMENT_PARAMS)
+        analysis = _analyze_alignment(seq1, seq2, DEFAULT_ADJUSTMENT_PARAMS)
 
         # Check required fields exist
         assert hasattr(analysis, 'identity')
@@ -165,11 +165,11 @@ class TestUnifiedAnalysisFunction:
         assert hasattr(analysis, 'variant_ranges')
 
     def test_analysis_metrics_match_score_alignment(self):
-        """Metrics from _unified_analysis should match score_alignment output."""
+        """Metrics from _analyze_alignment should match score_alignment output."""
         seq1 = "AAAA-TT"
         seq2 = "AAA--TT"
 
-        analysis = _unified_analysis(seq1, seq2, DEFAULT_ADJUSTMENT_PARAMS)
+        analysis = _analyze_alignment(seq1, seq2, DEFAULT_ADJUSTMENT_PARAMS)
         result = score_alignment(seq1, seq2, adjust_gaps=False)
 
         assert analysis.identity == result.identity
@@ -183,7 +183,7 @@ class TestUnifiedAnalysisFunction:
         seq1 = "ATCG-ATCG-ATCG"
         seq2 = "ATCGXATCGYATCG"
 
-        analysis = _unified_analysis(seq1, seq2, DEFAULT_ADJUSTMENT_PARAMS)
+        analysis = _analyze_alignment(seq1, seq2, DEFAULT_ADJUSTMENT_PARAMS)
 
         # Should have 2 variant ranges (at positions 4 and 9)
         assert len(analysis.variant_ranges) == 2
@@ -239,7 +239,7 @@ class TestScoreStringGeneration:
         result_false = score_alignment(seq1, seq2, adjust_gaps=False)
         result_true = score_alignment(seq1, seq2, adjust_gaps=True)
 
-        # For stuffed output
+        # For annotated output
         assert len(result_false.score_aligned) == len(result_false.seq1_aligned)
         assert len(result_false.score_aligned) == len(result_false.seq2_aligned)
 
