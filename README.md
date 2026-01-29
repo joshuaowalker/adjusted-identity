@@ -127,13 +127,44 @@ from adjusted_identity import align_and_score
 
 result = align_and_score("ATCGRAAATGTC", "ATCGAAAAATGTC")
 print(f"Seq1: {result.seq1_aligned}")
-print(f"Seq2: {result.seq2_aligned}") 
+print(f"Seq2: {result.seq2_aligned}")
 print(f"Score: {result.score_aligned}")
 # Output might show: ||||==||||||
 #                    ATCG = exact matches (||||)
 #                    R vs A = ambiguous match (=)
 #                    AAA vs AAAA = homopolymer extension (=)
 ```
+
+### Gap-Adjusted Visualization
+
+By default, the output alignment strings preserve the original gap positions from the aligner. However, since standard aligners don't distinguish homopolymer extensions from true indels, the gap placement may not reflect how positions were actually scored.
+
+Use `adjust_gaps=True` to rewrite gap positions so the visualization directly matches the scoring interpretation:
+
+```python
+from adjusted_identity import align_and_score
+
+# These sequences differ only in homopolymer lengths (4A+3T vs 3A+4T)
+seq1 = "AAAATTT"
+seq2 = "AAATTTT"
+
+# Default: alignment strings show A-vs-T at position 4 (looks like substitution)
+result = align_and_score(seq1, seq2, adjust_gaps=False)
+print(f"Seq1:  {result.seq1_aligned}")   # AAAATTT
+print(f"Seq2:  {result.seq2_aligned}")   # AAATTTT
+print(f"Score: {result.score_aligned}")  # |||=|||  (score shows extension, but alignment hides it)
+
+# Adjusted: gaps inserted to reveal the homopolymer interpretation
+result = align_and_score(seq1, seq2, adjust_gaps=True)
+print(f"Seq1:  {result.seq1_aligned}")   # AAAA-TTT
+print(f"Seq2:  {result.seq2_aligned}")   # AAA-TTTT
+print(f"Score: {result.score_aligned}")  # |||==|||  (two extensions now visible)
+
+# Identity is 1.0 in both cases - the adjustment is purely visual
+print(f"Identity: {result.identity}")    # 1.0
+```
+
+The `adjust_gaps=True` mode is particularly useful when you need to visually inspect *why* positions were scored a certain way—each position in the output alignment corresponds directly to its scoring marker.
 
 ### Repeat Motif Handling
 
@@ -223,7 +254,7 @@ A **higher-level function** that combines fast edlib alignment with the scoring 
 
 ### Core Function
 
-#### `score_alignment(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_format=None)`
+#### `score_alignment(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_format=None, adjust_gaps=False)`
 
 **The core implementation** - applies MycoBLAST-style adjustments to pre-aligned sequences from any source.
 
@@ -236,6 +267,7 @@ A **higher-level function** that combines fast edlib alignment with the scoring 
 - `seq1_aligned`, `seq2_aligned` (str): Pre-aligned sequences with gaps (must be same length)
 - `adjustment_params` (AdjustmentParams, optional): Adjustment parameters
 - `scoring_format` (ScoringFormat, optional): Scoring visualization format
+- `adjust_gaps` (bool, optional): If `True`, rewrite gap positions so the output alignment matches the scoring interpretation. Output strings may have different length than input. Defaults to `False`.
 
 **Returns:**
 - `AlignmentResult`: Scoring results and metrics
@@ -254,7 +286,7 @@ print(f"Adjusted identity: {result.identity:.3f}")
 
 ### Convenience Function
 
-#### `align_and_score(seq1, seq2, adjustment_params=None, scoring_format=None)`
+#### `align_and_score(seq1, seq2, adjustment_params=None, scoring_format=None, adjust_gaps=False)`
 
 **High-level convenience function** that handles both alignment and scoring in one step.
 
@@ -267,6 +299,7 @@ print(f"Adjusted identity: {result.identity:.3f}")
 - `seq1`, `seq2` (str): Raw DNA sequences to compare
 - `adjustment_params` (AdjustmentParams, optional): Adjustment parameters
 - `scoring_format` (ScoringFormat, optional): Scoring visualization format
+- `adjust_gaps` (bool, optional): If `True`, rewrite gap positions so the output alignment matches the scoring interpretation. Output strings may have different length than input. Defaults to `False`.
 
 **Returns:**
 - `AlignmentResult`: Contains identity metrics, alignment, and coverage information
@@ -327,6 +360,8 @@ AlignmentResult(
     score_aligned="||||=|||"       # Scoring visualization
 )
 ```
+
+**Note:** When `adjust_gaps=True`, the `seq1_aligned` and `seq2_aligned` strings are rewritten so gap positions match the scoring interpretation. This makes the `score_aligned` visualization directly interpretable position-by-position, but the output length may differ from the input alignment.
 
 ### Constants
 
@@ -538,6 +573,14 @@ The test suite includes:
 
 This package implements the sequence preprocessing approach described in the MycoBLAST algorithm by Stephen Russell and Mycota Lab, adapted for general-purpose DNA sequence comparison. The foundational research is detailed in ["Why NCBI BLAST identity scores can be misleading for fungi"](https://mycotalab.substack.com/p/why-ncbi-blast-identity-scores-can).
 
+### Why Post-Hoc Adjustment?
+
+Standard sequence alignment algorithms use gap penalties that don't distinguish between different biological contexts. Specifically, they penalize gaps uniformly regardless of whether the gap occurs within a homopolymer run (e.g., AAAA vs AAA) or represents a true insertion/deletion event.
+
+For many applications—particularly DNA barcoding where sequencing technology introduces homopolymer length variation as a technical artifact—it would be desirable to assign zero penalty to homopolymer length differences while still penalizing other indels normally. However, existing aligners don't support such context-dependent gap costs.
+
+This package addresses the limitation by applying a post-hoc adjustment: we use a standard aligner to establish positional correspondence between sequences, then rescore the alignment with homopolymer-aware logic that treats length variation in repetitive tracts as neutral.
+
 ### How the Variant Range Algorithm Works
 
 Starting in v0.2.0, this package uses a **variant range algorithm** that provides more accurate scoring for complex indel patterns, especially in multi-sequence alignments.
@@ -606,6 +649,16 @@ Mycota Lab. https://mycotalab.substack.com/p/why-ncbi-blast-identity-scores-can
 BSD 2-Clause License - see [LICENSE](LICENSE) file for details.
 
 ## Changelog
+
+### Version 0.2.5
+- **New Feature**: Added `adjust_gaps` parameter to `score_alignment()` and `align_and_score()`
+  - When `adjust_gaps=True`, gap positions are rewritten so the output alignment matches the scoring interpretation
+  - Makes visualization directly interpretable position-by-position
+  - Identity metrics are identical regardless of `adjust_gaps` setting
+  - Defaults to `False` for full backward compatibility
+- **Architecture**: Unified single-pass analysis ensures both output modes produce identical metrics
+- **Internal**: Removed deprecated `_score_alignment_impl` function
+- **Internal**: Renamed private API functions for clarity
 
 ### Version 0.2.4
 - Added CI workflow to run tests automatically on push and pull requests
