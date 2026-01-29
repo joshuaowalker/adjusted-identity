@@ -352,7 +352,6 @@ class TestPerformanceRegression:
         default_time = time.perf_counter() - start
 
         # The default path should complete in reasonable time
-        # (no strict comparison since _score_alignment_impl is internal)
         assert default_time < 5.0, f"Default path took {default_time:.2f}s for 100 iterations"
 
     def test_adjust_gaps_reasonable_overhead(self):

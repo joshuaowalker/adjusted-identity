@@ -165,8 +165,7 @@ class TestUnifiedMetricsCases:
         print(f"  scored_positions={result_true.scored_positions}")
         print(f"  score_aligned: {result_true.score_aligned}")
 
-        # Document: currently these should be equal
-        # (the _score_alignment_impl handles this case consistently)
+        # Document: these are equal due to unified architecture
         assert result_false.identity == result_true.identity
         assert result_false.mismatches == result_true.mismatches
 
