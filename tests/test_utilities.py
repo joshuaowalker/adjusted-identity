@@ -9,6 +9,7 @@ import pytest
 from adjusted_identity import (
     AdjustmentParams,
     ScoringFormat,
+    ScoringMode,
     AlignmentResult,
     IUPAC_CODES,
     _reverse_complement,
@@ -78,10 +79,34 @@ class TestDataClasses:
             seq2_aligned="ATCG",
             score_aligned="||||"
         )
-        
+
         # Should not be able to modify fields
         with pytest.raises(Exception):  # FrozenInstanceError or similar
             result.identity = 0.6
+
+    def test_adjustment_params_default_scoring_mode(self):
+        """Default scoring_mode should be LOCAL."""
+        params = AdjustmentParams()
+        assert params.scoring_mode == ScoringMode.LOCAL
+
+    def test_adjustment_params_scoring_mode_string_coercion(self):
+        """String 'global' should be coerced to ScoringMode.GLOBAL."""
+        params = AdjustmentParams(scoring_mode="global")
+        assert params.scoring_mode == ScoringMode.GLOBAL
+        assert isinstance(params.scoring_mode, ScoringMode)
+
+        params_local = AdjustmentParams(scoring_mode="local")
+        assert params_local.scoring_mode == ScoringMode.LOCAL
+
+    def test_adjustment_params_scoring_mode_invalid_string(self):
+        """Invalid string for scoring_mode should raise ValueError."""
+        with pytest.raises(ValueError):
+            AdjustmentParams(scoring_mode="invalid")
+
+    def test_adjustment_params_scoring_mode_enum(self):
+        """ScoringMode enum value should work directly."""
+        params = AdjustmentParams(scoring_mode=ScoringMode.GLOBAL)
+        assert params.scoring_mode == ScoringMode.GLOBAL
 
 
 class TestNucleotideEquivalence:
@@ -182,31 +207,53 @@ class TestScoringRegion:
         """Short sequences should not be trimmed."""
         seq1 = "ATCGATCG"
         seq2 = "ATCGATCG"
-        start, end = _find_scoring_region(seq1, seq2, end_skip_distance=20)
+        params = AdjustmentParams(end_skip_distance=20)
+        start, end = _find_scoring_region(seq1, seq2, params)
         assert start == 0
         assert end == 7  # Full sequence
-    
+
     def test_trimming_long_sequence(self):
         """Long sequences should have ends trimmed."""
         # Create sequences with 25bp on each side
         seq1 = "A" * 25 + "ATCG" + "T" * 25
         seq2 = "A" * 25 + "ATCG" + "T" * 25
-        start, end = _find_scoring_region(seq1, seq2, end_skip_distance=20)
-        
+        params = AdjustmentParams(end_skip_distance=20)
+        start, end = _find_scoring_region(seq1, seq2, params)
+
         # Should skip first 20 and last 20 from each sequence (0-indexed, so >= 19)
         assert start >= 19
         assert end <= len(seq1) - 20  # end can be at the boundary
-    
+
     def test_trimming_with_gaps(self):
         """Trimming should account for gaps in sequences."""
         # Sequence with gaps at start
         seq1 = "----" + "A" * 25 + "ATCG" + "T" * 25
         seq2 = "AAAA" + "A" * 25 + "ATCG" + "T" * 25
-        start, end = _find_scoring_region(seq1, seq2, end_skip_distance=20)
-        
+        params = AdjustmentParams(end_skip_distance=20)
+        start, end = _find_scoring_region(seq1, seq2, params)
+
         # Should account for gap positions
         assert start > 0
         assert end < len(seq1) - 1
+
+    def test_global_mode_returns_full_range(self):
+        """GLOBAL mode with end_skip_distance=0 returns full alignment range."""
+        seq1 = "---ATCG---"
+        seq2 = "AAAATCGTTT"
+        params = AdjustmentParams(scoring_mode=ScoringMode.GLOBAL, end_skip_distance=0)
+        start, end = _find_scoring_region(seq1, seq2, params)
+        assert start == 0
+        assert end == 9
+
+    def test_local_mode_returns_overlap(self):
+        """LOCAL mode with end_skip_distance=0 returns overlap region."""
+        seq1 = "---ATCG---"
+        seq2 = "AAAATCGTTT"
+        params = AdjustmentParams(scoring_mode=ScoringMode.LOCAL, end_skip_distance=0)
+        start, end = _find_scoring_region(seq1, seq2, params)
+        # Overlap starts at position 3 (first non-gap in both), ends at 6
+        assert start == 3
+        assert end == 6
 
 
 class TestReverseComplement:

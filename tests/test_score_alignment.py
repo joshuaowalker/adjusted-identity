@@ -12,6 +12,7 @@ from adjusted_identity import (
     score_alignment,
     align_and_score,
     AdjustmentParams,
+    ScoringMode,
     ScoringFormat,
     DEFAULT_ADJUSTMENT_PARAMS,
     RAW_ADJUSTMENT_PARAMS,
@@ -1390,3 +1391,91 @@ class TestVariantRangeAlgorithm:
         result = score_alignment("AAA-TT", "AAAXTT", DEFAULT_ADJUSTMENT_PARAMS)
         assert " " in result.score_aligned  # Core indel shows as space
         assert result.mismatches == 1
+
+
+class TestScoringMode:
+    """Test LOCAL vs GLOBAL scoring modes with pre-aligned sequences."""
+
+    def test_global_scores_terminal_gaps(self):
+        """GLOBAL mode should score terminal gaps as mismatches."""
+        # Pre-aligned: seq1 has leading gaps (terminal gap region)
+        params = AdjustmentParams(
+            scoring_mode=ScoringMode.GLOBAL,
+            normalize_indels=False,
+            normalize_homopolymers=False,
+        )
+        result = score_alignment("---ATCG", "TTTATCG", params)
+        # All 7 positions scored; 3 leading positions are gaps vs nucleotides
+        assert result.scored_positions == 7
+        assert result.mismatches == 3
+
+    def test_local_excludes_terminal_gaps(self):
+        """LOCAL mode should exclude terminal gaps from scoring."""
+        params = AdjustmentParams(
+            scoring_mode=ScoringMode.LOCAL,
+            normalize_indels=False,
+            normalize_homopolymers=False,
+        )
+        result = score_alignment("---ATCG", "TTTATCG", params)
+        # Only overlap region (ATCG) is scored
+        assert result.scored_positions == 4
+        assert result.mismatches == 0
+
+    def test_global_local_same_sequences_identical(self):
+        """For identical sequences, LOCAL and GLOBAL should give same result."""
+        local = score_alignment("ATCGATCG", "ATCGATCG",
+                                AdjustmentParams(scoring_mode=ScoringMode.LOCAL))
+        glob = score_alignment("ATCGATCG", "ATCGATCG",
+                               AdjustmentParams(scoring_mode=ScoringMode.GLOBAL))
+        assert local.identity == glob.identity == 1.0
+        assert local.mismatches == glob.mismatches == 0
+
+    def test_default_is_local(self):
+        """Default scoring mode should be LOCAL."""
+        params = AdjustmentParams()
+        assert params.scoring_mode == ScoringMode.LOCAL
+
+    def test_global_with_normalize_indels_collapses_terminal_gap(self):
+        """GLOBAL mode with normalize_indels=True collapses terminal gap to 1 event."""
+        params = AdjustmentParams(
+            scoring_mode=ScoringMode.GLOBAL,
+            normalize_indels=True,
+            normalize_homopolymers=False,
+        )
+        result = score_alignment("---ATCG", "TTTATCG", params)
+        # Terminal gap region (3 positions) treated as single normalized indel
+        # Plus 4 matching positions in ATCG
+        assert result.mismatches == 1  # Normalized to single event
+
+    def test_global_composes_with_end_skip_distance(self):
+        """GLOBAL mode + end_skip_distance should trim from full alignment bounds."""
+        # Long enough sequences for end trimming to activate
+        seq1 = "---" + "A" * 25 + "XXXX" + "T" * 25
+        seq2 = "TTT" + "A" * 25 + "TTTT" + "T" * 25
+        params = AdjustmentParams(
+            scoring_mode=ScoringMode.GLOBAL,
+            end_skip_distance=20,
+        )
+        result = score_alignment(seq1, seq2, params)
+        # End trimming should still work; middle region is scored
+        assert result.scored_positions > 0
+
+    def test_asymmetric_length_scenario(self):
+        """The motivating scenario: 220bp vs 660bp gives ~100% LOCAL, ~33% GLOBAL."""
+        short = "ATCG" * 55   # 220bp
+        long = "ATCG" * 165   # 660bp
+
+        local_result = align_and_score(short, long)
+        global_result = align_and_score(
+            short, long,
+            AdjustmentParams(scoring_mode=ScoringMode.GLOBAL, normalize_indels=False)
+        )
+
+        # LOCAL: overlap matches perfectly
+        assert local_result.identity > 0.95
+
+        # GLOBAL: terminal gaps penalize identity
+        assert global_result.identity < 0.5
+
+        # GLOBAL mode coverage reflects overlap within full NW alignment
+        assert global_result.seq2_coverage < 0.5

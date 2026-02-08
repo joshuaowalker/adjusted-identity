@@ -15,6 +15,7 @@ A Python package implementing MycoBLAST-style sequence identity calculations for
 - **MSA Dual-Gap Support**: Correctly handle sequences from multi-sequence alignments (MSA) where both sequences may have gaps at the same position
 - **End Trimming**: Skip mismatches in terminal regions to avoid sequencing artifacts (disabled by default, set `end_skip_distance` to enable)
 - **Indel Normalization**: Count contiguous indels as single evolutionary events
+- **LOCAL / GLOBAL Scoring Modes**: Choose between overlap-only scoring (default) or full-alignment scoring that penalizes terminal gaps — critical for comparing sequences of very different lengths
 - **Comprehensive Alignment**: Multi-stage bidirectional alignment optimization using edlib
 - **Flexible Configuration**: Enable/disable individual adjustments as needed
 
@@ -111,6 +112,34 @@ result = align_and_score(barcode1, barcode2)
 print(f"Identity with IUPAC handling: {result.identity:.3f}")  # Should be 1.0
 print(f"Score pattern: {result.score_aligned}")  # Shows '=' for ambiguous matches
 ```
+
+### Comparing Sequences of Different Lengths (LOCAL vs GLOBAL)
+
+By default, identity is calculated over the overlap region only (`LOCAL` mode). This works well for most use cases, but can be misleading when comparing a short sequence against a much longer one — the short fragment may match perfectly within its overlap while covering only a fraction of the target.
+
+`GLOBAL` mode uses Needleman-Wunsch alignment and scores the full alignment including terminal gaps, giving a more conservative identity estimate:
+
+```python
+from adjusted_identity import align_and_score, AdjustmentParams, ScoringMode
+
+short_seq = "ATCG" * 55   # 220bp truncated sequence
+full_seq  = "ATCG" * 165  # 660bp full-length target
+
+# LOCAL (default): scores only the overlapping region
+local_result = align_and_score(short_seq, full_seq)
+print(f"LOCAL identity: {local_result.identity:.3f}")   # ~1.000
+print(f"LOCAL seq2_coverage: {local_result.seq2_coverage:.3f}")
+
+# GLOBAL: terminal gaps count against identity
+global_params = AdjustmentParams(scoring_mode=ScoringMode.GLOBAL, normalize_indels=False)
+global_result = align_and_score(short_seq, full_seq, global_params)
+print(f"GLOBAL identity: {global_result.identity:.3f}")  # ~0.333
+print(f"GLOBAL seq2_coverage: {global_result.seq2_coverage:.3f}")
+```
+
+Use `LOCAL` mode (the default) when you want overlap-only identity, e.g. when sequences are expected to be similar in length or when coverage is checked separately. Use `GLOBAL` mode when identity should reflect how much of the target is actually covered, e.g. for clustering or when comparing sequences of very different lengths.
+
+**Tip:** You can also pass the mode as a string: `AdjustmentParams(scoring_mode="global")`.
 
 ### Understanding Score Patterns
 
@@ -288,7 +317,7 @@ print(f"Adjusted identity: {result.identity:.3f}")
 
 #### `align_and_score(seq1, seq2, adjustment_params=None, scoring_format=None, adjust_gaps=False)`
 
-**High-level convenience function** that handles both alignment and scoring in one step.
+**High-level convenience function** that handles both alignment and scoring in one step. Uses semi-global (HW) alignment by default, or Needleman-Wunsch (NW) alignment when `scoring_mode=ScoringMode.GLOBAL`.
 
 **Use this when:**
 - You want a simple, fast solution without additional alignment tools
@@ -314,6 +343,17 @@ print(f"Identity: {result.identity:.3f}")
 
 ### Configuration Classes
 
+#### `ScoringMode`
+
+Controls whether terminal gaps are included in identity scoring:
+
+```python
+from adjusted_identity import ScoringMode
+
+ScoringMode.LOCAL   # Score overlap region only (default)
+ScoringMode.GLOBAL  # Score full alignment including terminal gaps (NW alignment)
+```
+
 #### `AdjustmentParams`
 
 Configure which sequence adjustments to apply:
@@ -324,7 +364,8 @@ AdjustmentParams(
     handle_iupac_overlap=True,      # Allow IUPAC ambiguity intersections
     normalize_indels=True,          # Count contiguous indels as single events
     end_skip_distance=0,           # Skip first/last N nucleotides (0 = disabled by default)
-    max_repeat_motif_length=2      # Maximum repeat motif length to detect (1=homopolymers only, 2=dinucleotides, etc.)
+    max_repeat_motif_length=2,     # Maximum repeat motif length to detect (1=homopolymers only, 2=dinucleotides, etc.)
+    scoring_mode=ScoringMode.LOCAL # LOCAL (overlap only) or GLOBAL (full alignment with terminal gaps)
 )
 ```
 

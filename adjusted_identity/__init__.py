@@ -38,6 +38,19 @@ See: https://mycotalab.substack.com/p/why-ncbi-blast-identity-scores-can
 import edlib
 import re
 from dataclasses import dataclass
+from enum import Enum
+
+
+class ScoringMode(str, Enum):
+    """Controls whether terminal gaps are included in identity scoring.
+
+    LOCAL: Score only the overlap region (default, current behavior).
+           Terminal gaps are excluded from identity calculation.
+    GLOBAL: Score the full alignment including terminal gaps.
+            Uses Needleman-Wunsch (NW) alignment instead of semi-global.
+    """
+    LOCAL = "local"
+    GLOBAL = "global"
 # Custom reverse complement implementation (replaces BioPython dependency)
 # Uses optimized str.translate() for performance that exceeds BioPython
 _RC_TRANSLATE_TABLE = str.maketrans(
@@ -136,9 +149,13 @@ class AdjustmentParams:
     normalize_indels: bool = True            # Count contiguous indels as single events
     end_skip_distance: int = 0               # Nucleotides to skip from each end (0 = disabled by default)
     max_repeat_motif_length: int = 2         # Maximum repeat motif length to detect (default: dinucleotides)
+    scoring_mode: ScoringMode = ScoringMode.LOCAL  # LOCAL scores overlap only; GLOBAL includes terminal gaps
 
     def __post_init__(self):
-        """Validate parameter combinations."""
+        """Validate parameter combinations and coerce types."""
+        # Coerce string to ScoringMode enum
+        if isinstance(self.scoring_mode, str) and not isinstance(self.scoring_mode, ScoringMode):
+            object.__setattr__(self, 'scoring_mode', ScoringMode(self.scoring_mode))
         if self.normalize_homopolymers and self.max_repeat_motif_length < 1:
             raise ValueError(
                 f"Contradictory configuration: normalize_homopolymers=True requires "
@@ -363,88 +380,97 @@ def _parse_suffix_gap_from_cigar(cigar_string):
     
     return None
 
-def _find_scoring_region(seq1_aligned, seq2_aligned, end_skip_distance):
+def _find_scoring_region(seq1_aligned, seq2_aligned, adjustment_params):
     """
     Find the [start, end] region of the alignment where mismatches should be counted.
-    
+
     Implements MycoBLAST "digital end trimming" by skipping the first/last end_skip_distance
-    nucleotides (not alignment positions) from each sequence to avoid counting sequencing 
+    nucleotides (not alignment positions) from each sequence to avoid counting sequencing
     artifacts near read ends.
-    
-    Special case: When end_skip_distance=0, only score positions where both sequences 
-    have non-gap characters (no overhang scoring).
-    
+
+    Scoring modes:
+    - LOCAL + end_skip_distance=0: Score only overlap region (both sequences have content)
+    - LOCAL + end_skip_distance>0: Score overlap minus trimmed ends
+    - GLOBAL + end_skip_distance=0: Score full alignment (0, len-1)
+    - GLOBAL + end_skip_distance>0: Score full alignment minus trimmed ends
+
     IMPORTANT: This function counts NUCLEOTIDES (non-gap characters), not alignment positions.
     End trimming only activates when both sequences have >= end_skip_distance nucleotides
     available to skip from each end.
-    
-    Behavior:
-    - end_skip_distance=0: Score only overlap region (both sequences have content)
-    - Short sequences (< 2×end_skip_distance nucleotides): Returns full range [0, len-1]
-    - Long sequences (≥ 2×end_skip_distance nucleotides): Returns trimmed range excluding ends
-    - Gap characters ('-') are ignored when counting nucleotides
-    
-    Example:
-        seq1_aligned = "AAAA-TCGX-TTTT"  # 12 nucleotides, 14 alignment positions
-        seq2_aligned = "-AAAATCGA-TTTT"  # 12 nucleotides, 14 alignment positions
-        end_skip_distance = 3
-        
-        Result: Skip first 3 and last 3 nucleotides from each sequence
-        → scoring_start=4, scoring_end=9 (positions where middle nucleotides align)
-    
+
     Args:
         seq1_aligned, seq2_aligned: Aligned sequences with gaps (must be same length)
-        end_skip_distance: Number of nucleotides to skip from each end (typically 20)
-        
+        adjustment_params: AdjustmentParams controlling scoring_mode and end_skip_distance
+
     Returns:
         tuple: (scoring_start, scoring_end) - inclusive range of alignment positions to score
     """
     alignment_length = len(seq1_aligned)
-    
-    # Special case: end_skip_distance=0 means score only overlap region
+    end_skip_distance = adjustment_params.end_skip_distance
+    is_global = adjustment_params.scoring_mode == ScoringMode.GLOBAL
+
     if end_skip_distance == 0:
-        # Find first position where both sequences have content
+        if is_global:
+            # GLOBAL: score the entire alignment
+            return 0, alignment_length - 1
+
+        # LOCAL: score only overlap region (both sequences have content)
         scoring_start = 0
         for pos in range(alignment_length):
             if seq1_aligned[pos] != '-' and seq2_aligned[pos] != '-':
                 scoring_start = pos
                 break
-        
-        # Find last position where both sequences have content
+
         scoring_end = alignment_length - 1
         for pos in range(alignment_length - 1, -1, -1):
             if seq1_aligned[pos] != '-' and seq2_aligned[pos] != '-':
                 scoring_end = pos
                 break
-        
+
         return scoring_start, scoring_end
-    
-    # General case: skip end_skip_distance nucleotides from each end
-    # Find scoring start: first position where both sequences have >= end_skip_distance bp
+
+    # end_skip_distance > 0: skip nucleotides from each end
+    if is_global:
+        # GLOBAL: start from full alignment bounds, then trim nucleotides
+        scoring_start = 0
+        scoring_end = alignment_length - 1
+    else:
+        # LOCAL: start from overlap bounds, then trim nucleotides
+        scoring_start = 0
+        for pos in range(alignment_length):
+            if seq1_aligned[pos] != '-' and seq2_aligned[pos] != '-':
+                scoring_start = pos
+                break
+        scoring_end = alignment_length - 1
+        for pos in range(alignment_length - 1, -1, -1):
+            if seq1_aligned[pos] != '-' and seq2_aligned[pos] != '-':
+                scoring_end = pos
+                break
+
+    # From the determined bounds, skip end_skip_distance nucleotides inward
     seq1_count = seq2_count = 0
-    scoring_start = 0
-    for pos in range(alignment_length):
+    trimmed_start = scoring_start
+    for pos in range(scoring_start, alignment_length):
         if seq1_aligned[pos] != '-':
             seq1_count += 1
         if seq2_aligned[pos] != '-':
             seq2_count += 1
         if seq1_count >= end_skip_distance and seq2_count >= end_skip_distance:
-            scoring_start = pos
+            trimmed_start = pos
             break
-    
-    # Find scoring end: last position where both sequences have >= end_skip_distance bp remaining
+
     seq1_count = seq2_count = 0
-    scoring_end = alignment_length - 1
-    for pos in range(alignment_length - 1, -1, -1):
+    trimmed_end = scoring_end
+    for pos in range(scoring_end, -1, -1):
         if seq1_aligned[pos] != '-':
             seq1_count += 1
         if seq2_aligned[pos] != '-':
             seq2_count += 1
         if seq1_count >= end_skip_distance and seq2_count >= end_skip_distance:
-            scoring_end = pos
+            trimmed_end = pos
             break
-    
-    return scoring_start, scoring_end
+
+    return trimmed_start, trimmed_end
 
 
 def _extract_left_context(seq1_aligned, seq2_aligned, position, length):
@@ -1085,7 +1111,7 @@ def _analyze_alignment(seq1_aligned, seq2_aligned, adjustment_params=None):
 
     # Find scoring region
     scoring_start, scoring_end = _find_scoring_region(
-        seq1_aligned, seq2_aligned, adjustment_params.end_skip_distance
+        seq1_aligned, seq2_aligned, adjustment_params
     )
 
     # Find variant ranges
@@ -1592,6 +1618,34 @@ def score_alignment(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_
         )
 
 
+def _align_nw(seq1, seq2):
+    """
+    Needleman-Wunsch (global) alignment wrapper using edlib.
+
+    Unlike align_edlib_bidirectional, NW alignment guarantees both sequences
+    are fully consumed — no bidirectional trimming trick needed.
+
+    Args:
+        seq1, seq2: DNA sequences to align
+
+    Returns:
+        dict: {'aligned_seq1': str, 'aligned_seq2': str} or None if alignment fails
+    """
+    if len(seq1) == 0 or len(seq2) == 0:
+        return None
+
+    result = edlib.align(seq1, seq2, mode="NW", task="path")
+
+    if result['editDistance'] == -1:
+        return None
+
+    alignment = edlib.getNiceAlignment(result, seq1, seq2)
+    return {
+        'aligned_seq1': alignment['query_aligned'],
+        'aligned_seq2': alignment['target_aligned'],
+    }
+
+
 def align_edlib_bidirectional(seq1, seq2):
     """
     Multi-stage alignment optimization using CIGAR-based suffix detection.
@@ -1755,8 +1809,11 @@ def align_and_score(seq1, seq2, adjustment_params=None, scoring_format=None, adj
             score_aligned=''
         )
 
-    # Perform multi-stage bidirectional alignment with suffix trimming
-    align_result = align_edlib_bidirectional(seq1, seq2)
+    # Choose alignment algorithm based on scoring mode
+    if adjustment_params.scoring_mode == ScoringMode.GLOBAL:
+        align_result = _align_nw(seq1, seq2)
+    else:
+        align_result = align_edlib_bidirectional(seq1, seq2)
 
     # Check for alignment failure (sentinel value)
     if align_result is None:

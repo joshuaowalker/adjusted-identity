@@ -8,8 +8,10 @@ These tests focus on the alignment algorithms and end-to-end functionality.
 import pytest
 from adjusted_identity import (
     align_edlib_bidirectional,
+    _align_nw,
     align_and_score,
     AdjustmentParams,
+    ScoringMode,
     DEFAULT_ADJUSTMENT_PARAMS,
     RAW_ADJUSTMENT_PARAMS,
 )
@@ -192,8 +194,77 @@ class TestPerformanceAndRobustness:
         # Problematic pair 2: Sequences with IUPAC codes and complex alignment
         seq1 = 'TMASYMTTMTTCGTMAGAWGAACTGCGGAAGGATCATTATTGAAGGAGAATGGGTGGCAAGGGCTGTTGCTGGCTTGAATGAGCATGTGCACGTCTGTTGCTRCTTATTTCATTCATWTTTCCTCCTGTGCAYGTTTTGTAGACACTTGGGAATGAGAGGTTGGTTGTAATGTAATGAATTGACCTCTTGAGGTSARTCTGGGWGTCTATGACMTTTTTATWAACMCSGCTGSWTGTGTATGGAATGAGAYTGKAGGTTTTTAATKAAAAAMCCTKTWAARRKAAAAARYAACACTTTMCAACACGGATCTTGTGGCTCTCSYCTCTRAAAAAAACSCCGCAAAATGSTAAAAAATGTGKAAATTGGAAAATTCWGWGAAATCTCAAATTTTTAAACSCCTTGTGCTCCCCGTGGTTTTCAGAAGAAYGYGCCTGTTTGAGTGWTTTTCRAATCTCTCAAAATGTTWTGTGCWATTMTTGGWGCWTGGGAATTTTGGAAGTTGGGGGTTGCTGGTCAAKTGKAAAGSTGTTCGGTTCTATAAAAAASSATGAGCTKGGGGCTCTCTRCWCKCGTGATGGGKGATCTACGCTCTGAGACGWGWGATGAGGTGTCTGCTGTCTRCTGATCCTCAGTGCMCAAKATGATAAACTTGACATCTGATCTCGTATGACTACRCGCTGCMCTYWAGCATATCATATTMYGARGAARRRRGRAAAAAAA'
         seq2 = 'ACCTGCGGAAGGATCATTATTGAAGGAGAATGGGTGGCAAGGGCTGTTGCTGGCTTGAATGAGCATGTGCACGTCTGTTGCTRCTTATTTCATTCATWTTTCCTCCTGTGCAYGTTTTGTAGACACTTGGGAATGAGAGGTTGGTTGTAATG'
-        
+
         # This should now work without error
         result = align_and_score(seq1, seq2)
         assert result is not None
         assert 0.0 <= result.identity <= 1.0
+
+
+class TestNWAlignment:
+    """Test the Needleman-Wunsch alignment wrapper."""
+
+    def test_identical_sequences(self):
+        """NW alignment of identical sequences."""
+        result = _align_nw("ATCG", "ATCG")
+        assert result is not None
+        assert result['aligned_seq1'] == "ATCG"
+        assert result['aligned_seq2'] == "ATCG"
+
+    def test_different_lengths(self):
+        """NW alignment with different lengths produces gaps."""
+        result = _align_nw("ATCG", "ATCGATCG")
+        assert result is not None
+        assert len(result['aligned_seq1']) == len(result['aligned_seq2'])
+        # Shorter sequence should have gaps
+        assert '-' in result['aligned_seq1']
+
+    def test_empty_sequences_return_none(self):
+        """Empty sequences should return None."""
+        assert _align_nw("", "ATCG") is None
+        assert _align_nw("ATCG", "") is None
+        assert _align_nw("", "") is None
+
+    def test_with_mismatches(self):
+        """NW alignment with mismatches."""
+        result = _align_nw("ATCG", "AXCG")
+        assert result is not None
+        assert len(result['aligned_seq1']) == len(result['aligned_seq2'])
+
+
+class TestGlobalModeEndToEnd:
+    """End-to-end tests for GLOBAL scoring mode via align_and_score."""
+
+    def test_identical_sequences_global(self):
+        """Identical sequences should have perfect identity in GLOBAL mode."""
+        params = AdjustmentParams(scoring_mode=ScoringMode.GLOBAL)
+        result = align_and_score("ATCGATCG", "ATCGATCG", params)
+        assert result.identity == 1.0
+        assert result.mismatches == 0
+
+    def test_asymmetric_length_global_vs_local(self):
+        """Key scenario: short vs long sequence — GLOBAL penalizes, LOCAL doesn't."""
+        short = "ATCG" * 55   # 220bp
+        long = "ATCG" * 165   # 660bp
+
+        local_result = align_and_score(short, long)
+        global_result = align_and_score(
+            short, long,
+            AdjustmentParams(scoring_mode=ScoringMode.GLOBAL, normalize_indels=False)
+        )
+
+        # LOCAL should report ~100% identity (overlap region matches)
+        assert local_result.identity > 0.95
+
+        # GLOBAL should report ~33% identity (terminal gaps penalized)
+        assert global_result.identity < 0.5
+        assert global_result.identity > 0.2
+
+        # GLOBAL mode reports coverage based on overlap within the full NW alignment
+        assert global_result.seq2_coverage < 0.5
+
+    def test_global_empty_sequence(self):
+        """Empty sequence handling in GLOBAL mode."""
+        params = AdjustmentParams(scoring_mode=ScoringMode.GLOBAL)
+        result = align_and_score("", "ATCG", params)
+        assert result.identity == 0.0

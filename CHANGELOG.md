@@ -1,5 +1,13 @@
 # Changelog
 
+## Version 0.2.6
+- **New Feature**: Added `ScoringMode` enum (`LOCAL` / `GLOBAL`) to control whether terminal gaps are included in identity scoring
+  - `LOCAL` (default): Scores only the overlap region, excluding terminal gaps. Uses semi-global (HW) alignment. This is the existing behavior — all callers are unaffected.
+  - `GLOBAL`: Scores the full alignment including terminal gaps. Uses Needleman-Wunsch (NW) alignment. Solves the problem where a 220bp truncated sequence reports 100% identity against a 660bp full-length target because only the overlapping third is scored.
+  - Set via `AdjustmentParams(scoring_mode=ScoringMode.GLOBAL)` or `AdjustmentParams(scoring_mode="global")` (string coercion supported)
+- **New Function**: `_align_nw()` — Needleman-Wunsch alignment wrapper for GLOBAL mode
+- **API Change**: `_find_scoring_region()` now accepts `adjustment_params` instead of `end_skip_distance` (private function, no public API impact)
+
 ## Version 0.2.5
 - **New Feature**: Added `adjust_gaps` parameter to `score_alignment()` and `align_and_score()`
   - When `adjust_gaps=True`, gap positions are rewritten so the output alignment matches the scoring interpretation

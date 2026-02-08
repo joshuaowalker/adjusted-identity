@@ -74,14 +74,16 @@ twine upload dist/*
 
 ### Main Components
 
-1. **Data Classes** (`adjusted_identity/__init__.py:41-108`):
+1. **Data Classes & Enums** (`adjusted_identity/__init__.py`):
+   - `ScoringMode` - Enum: `LOCAL` (overlap only) or `GLOBAL` (full alignment with terminal gaps)
    - `AlignmentResult` - Contains alignment results and identity metrics
    - `ScoringFormat` - Format codes for alignment visualization
-   - `AdjustmentParams` - Parameters controlling sequence adjustments
+   - `AdjustmentParams` - Parameters controlling sequence adjustments (includes `scoring_mode`)
 
-2. **Core Functions** (`adjusted_identity/__init__.py:653-739`):
-   - `align_and_score()` - Main entry point for sequence comparison
-   - `align_edlib_bidirectional()` - Multi-stage alignment optimization
+2. **Core Functions** (`adjusted_identity/__init__.py`):
+   - `align_and_score()` - Main entry point for sequence comparison (routes to HW or NW alignment based on scoring mode)
+   - `align_edlib_bidirectional()` - Multi-stage semi-global alignment optimization (used by LOCAL mode)
+   - `_align_nw()` - Needleman-Wunsch global alignment wrapper (used by GLOBAL mode)
    - `score_alignment()` - Scoring with configurable adjustments
 
 3. **Adjustment Features**:
@@ -89,6 +91,7 @@ twine upload dist/*
    - IUPAC ambiguity code handling - allows different ambiguity codes to match
    - End trimming - skips mismatches in terminal regions (disabled by default, set `end_skip_distance` to enable)
    - Indel normalization - counts contiguous indels as single events
+   - LOCAL/GLOBAL scoring modes - controls whether terminal gaps affect identity
 
 ### Key Constants
 
@@ -109,17 +112,20 @@ The test suite is comprehensive and serves as documentation:
    - `TestCombinedAdjustments` - Multiple adjustments together
    - `TestEdgeCases` - Error conditions and edge cases
    - `TestDocumentationExamples` - Real-world usage examples
+   - `TestScoringMode` - LOCAL vs GLOBAL scoring mode comparisons
 
 2. **test_alignment.py**: Alignment algorithm tests
    - `TestAlignEdlibBidirectional` - Bidirectional alignment
    - `TestAlignAndScore` - End-to-end functionality
    - `TestRealWorldScenarios` - Mycological sequence examples
+   - `TestNWAlignment` - Needleman-Wunsch alignment wrapper
+   - `TestGlobalModeEndToEnd` - GLOBAL scoring mode end-to-end tests
 
 3. **test_utilities.py**: Utility function tests
-   - Data class validation and immutability
+   - Data class validation and immutability (including ScoringMode)
    - IUPAC nucleotide equivalence
    - CIGAR string parsing
-   - Homopolymer detection
+   - Scoring region identification (LOCAL and GLOBAL modes)
 
 ## Dependencies
 
