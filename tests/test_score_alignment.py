@@ -302,6 +302,138 @@ class TestHomopolymerAdjustment:
         assert result_no_match.mismatches <= 1
 
 
+class TestShortHomopolymerThreshold:
+    """Test hp_normalize_min_length threshold (short-HP demotion to counted edits).
+
+    Motivation: speconsense summarization (and other mycoBLAST-style callers who
+    want to preserve short-HP signal) can set this threshold to, e.g., 6 so that
+    HP length differences in runs shorter than length 6 count as edits while
+    longer HP runs remain blanket-normalized. See docs/hp_error_rate for the
+    empirical basis.
+    """
+
+    def test_default_matches_today_behavior(self):
+        """Default (threshold=1) normalizes every HP length diff, as before."""
+        result = score_alignment("AAA-TTT", "AAAATTT", DEFAULT_ADJUSTMENT_PARAMS)
+        assert DEFAULT_ADJUSTMENT_PARAMS.hp_normalize_min_length == 1
+        assert result.identity == 1.0
+        assert result.mismatches == 0
+        assert result.score_aligned == "|||=|||"
+
+    def test_short_run_counted_as_edit(self):
+        """Threshold=6: HP diff with min(L1,L2)=3 (AAA vs AAAA) counts as edit."""
+        params = AdjustmentParams(hp_normalize_min_length=6)
+        # seq1 has AAA (length 3), seq2 has AAAA (length 4) — shorter side is below threshold
+        result = score_alignment("AAA-TTT", "AAAATTT", params)
+        assert result.mismatches == 1
+        # 6 matches + 1 edit = 7 scored positions (indel counted)
+        assert result.scored_positions == 7
+        assert result.identity == pytest.approx(6 / 7, abs=0.001)
+
+    def test_long_run_still_normalized(self):
+        """Threshold=6: HP diff where min(L1,L2)>=6 still normalizes."""
+        params = AdjustmentParams(hp_normalize_min_length=6)
+        # seq1 has AAAAAA (length 6), seq2 has AAAAAAA (length 7) — both >= threshold
+        result = score_alignment("AAAAAA-TTT", "AAAAAAATTT", params)
+        assert result.mismatches == 0
+        assert result.identity == 1.0
+
+    def test_threshold_boundary_inclusive_on_normalize_side(self):
+        """At threshold exactly, normalize (min >= threshold)."""
+        # min(L1,L2) == 5, threshold == 5 -> normalize
+        params = AdjustmentParams(hp_normalize_min_length=5)
+        result = score_alignment("AAAAA-TTT", "AAAAAATTT", params)
+        assert result.mismatches == 0
+        assert result.identity == 1.0
+
+        # min(L1,L2) == 4, threshold == 5 -> edit
+        result2 = score_alignment("AAAA-TTT", "AAAAATTT", params)
+        assert result2.mismatches == 1
+
+    def test_normalize_indels_interaction(self):
+        """With normalize_indels=False, per-char edits count; with True, single edit."""
+        # Length diff is 2 (AA vs AAAA) — short-HP demoted to counted indel
+        params_norm = AdjustmentParams(hp_normalize_min_length=6, normalize_indels=True)
+        result_norm = score_alignment("AA--TTT", "AAAATTT", params_norm)
+        # 5 matches + 1 normalized indel edit position
+        assert result_norm.mismatches == 1
+        assert result_norm.scored_positions == 6
+
+        params_raw = AdjustmentParams(hp_normalize_min_length=6, normalize_indels=False)
+        result_raw = score_alignment("AA--TTT", "AAAATTT", params_raw)
+        # 5 matches + 2 edit positions for the two extra A's
+        assert result_raw.mismatches == 2
+        assert result_raw.scored_positions == 7
+
+    def test_no_effect_when_normalize_homopolymers_false(self):
+        """Threshold has no effect when HP normalization is off altogether."""
+        # RAW_ADJUSTMENT_PARAMS has normalize_homopolymers=False. Setting a
+        # high threshold should not change anything.
+        base = AdjustmentParams(
+            normalize_homopolymers=False,
+            handle_iupac_overlap=False,
+            normalize_indels=False,
+            end_skip_distance=0,
+        )
+        gated = AdjustmentParams(
+            normalize_homopolymers=False,
+            handle_iupac_overlap=False,
+            normalize_indels=False,
+            end_skip_distance=0,
+            hp_normalize_min_length=10,
+        )
+        r_base = score_alignment("AAA-TTT", "AAAATTT", base)
+        r_gated = score_alignment("AAA-TTT", "AAAATTT", gated)
+        assert r_base.identity == r_gated.identity
+        assert r_base.score_aligned == r_gated.score_aligned
+
+    def test_dinucleotide_extension_unaffected(self):
+        """Threshold applies only to motif length 1; dinucleotide repeats still normalize."""
+        # ACACAC vs ACACACAC — 3 AC's vs 4 AC's (dinucleotide extension)
+        params = AdjustmentParams(hp_normalize_min_length=10)
+        result = score_alignment("GG--ACACAC---AGG", "GGGTACACACACAGG-", params)
+        # The AC-dinucleotide extension should still be normalized regardless of
+        # hp_normalize_min_length, because motif length is 2, not 1.
+        # We assert that mismatches do not include a spurious short-HP edit
+        # for the AC extension. Exact identity isn't the focus; compare with
+        # same config at threshold=1 to confirm unchanged behavior.
+        baseline = AdjustmentParams(hp_normalize_min_length=1)
+        result_base = score_alignment(
+            "GG--ACACAC---AGG", "GGGTACACACACAGG-", baseline
+        )
+        assert result.identity == result_base.identity
+        assert result.mismatches == result_base.mismatches
+
+    def test_scoring_marker_default_is_space(self):
+        """Default short_hp_edit marker is space (matches other scored mismatches)."""
+        params = AdjustmentParams(hp_normalize_min_length=6)
+        result = score_alignment("AAA-TTT", "AAAATTT", params)
+        # The extension position (originally '=') should now render as the
+        # short_hp_edit marker, which defaults to ' '.
+        assert result.score_aligned == "||| |||"
+
+    def test_scoring_marker_custom(self):
+        """Custom short_hp_edit marker renders at demoted positions."""
+        params = AdjustmentParams(hp_normalize_min_length=6)
+        fmt = ScoringFormat(short_hp_edit='x')
+        result = score_alignment("AAA-TTT", "AAAATTT", params, fmt)
+        assert result.score_aligned == "|||x|||"
+
+    def test_validation_rejects_invalid_value(self):
+        """hp_normalize_min_length < 1 is rejected."""
+        with pytest.raises(ValueError, match="hp_normalize_min_length"):
+            AdjustmentParams(hp_normalize_min_length=0)
+
+    def test_adjust_gaps_output_marks_demoted_span(self):
+        """adjust_gaps=True also honors short_hp_edit marker on demoted ranges."""
+        params = AdjustmentParams(hp_normalize_min_length=6)
+        fmt = ScoringFormat(short_hp_edit='x')
+        result = score_alignment("AAA-TTT", "AAAATTT", params, fmt, adjust_gaps=True)
+        # The gap-adjusted alignment should render the demoted HP position with 'x'
+        assert 'x' in result.score_aligned
+        assert result.mismatches == 1
+
+
 class TestAmbiguousMatching:
     """Test the new ambiguous matching scoring code feature."""
     

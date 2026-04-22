@@ -1,5 +1,14 @@
 # Changelog
 
+## Version 0.2.7
+- **New Feature**: Added `hp_normalize_min_length` to `AdjustmentParams` (default `1`) — minimum homopolymer run length at which HP normalization applies
+  - When the shorter side's HP run length (`min(L1, L2)`) is below the threshold, the length difference is counted as an edit instead of being normalized away
+  - Applies only to true homopolymers (motif length 1); dinucleotide and longer repeat extensions are unaffected
+  - Default `1` preserves existing behavior (all HP runs normalized). Set higher (e.g. `6`) to preserve short-HP signal where per-position HP error rates are comparable to the non-HP substitution baseline — see the companion [hp_error_rate_report](https://github.com/joshuaowalker/speconsense/tree/main/docs/hp_error_rate) for the empirical basis
+  - Has no effect when `normalize_homopolymers=False`
+- **New Field**: Added `short_hp_edit` to `ScoringFormat` (default `' '`) for the visualization marker at demoted short-HP positions; defaults to a space so existing visualizations match other scored mismatches. Override (e.g. `ScoringFormat(short_hp_edit='x')`) for a debug-visible marker
+- **Internal**: `AlleleAnalysis` now records the motif length used for each extension (`left_motif_length`, `right_motif_length`), enabling the threshold check to target homopolymers specifically
+
 ## Version 0.2.6
 - **New Feature**: Added `ScoringMode` enum (`LOCAL` / `GLOBAL`) to control whether terminal gaps are included in identity scoring
   - `LOCAL` (default): Scores only the overlap region, excluding terminal gaps. Uses semi-global (HW) alignment. This is the existing behavior — all callers are unaffected.

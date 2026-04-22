@@ -9,7 +9,7 @@ A Python package implementing MycoBLAST-style sequence identity calculations for
 
 ## Features
 
-- **Homopolymer Length Normalization**: Ignore differences in homopolymer run lengths (e.g., "AAA" vs "AAAA")
+- **Homopolymer Length Normalization**: Ignore differences in homopolymer run lengths (e.g., "AAA" vs "AAAA"), with an optional minimum-run-length threshold (`hp_normalize_min_length`) so short-HP length differences can be treated as real edits while long runs remain normalized
 - **Repeat Motif Adjustment**: Handle dinucleotide and longer repeat motifs (e.g., "ATATAT" vs "ATATATAT")
 - **IUPAC Ambiguity Code Handling**: Allow different ambiguity codes to match via nucleotide intersection
 - **MSA Dual-Gap Support**: Correctly handle sequences from multi-sequence alignments (MSA) where both sequences may have gaps at the same position
@@ -147,7 +147,7 @@ The `score_aligned` field provides a visual representation of how each position 
 
 - `|` = Exact match between standard nucleotides (A=A, C=C, G=G, T=T)
 - `=` = Ambiguous match (IUPAC codes) or homopolymer/repeat extension
-- ` ` (space) = Substitution (mismatch)
+- ` ` (space) = Substitution, indel start, or short-HP edit (mismatch, default `short_hp_edit`)
 - `-` = Indel extension (normalized)
 - `.` = End-trimmed, dual-gap, or overhang position (not scored)
 
@@ -213,6 +213,43 @@ params = AdjustmentParams(
     max_repeat_motif_length=3  # Detect up to trinucleotide repeats (e.g., CAG)
 )
 result = align_and_score("CAGCAG---TTC", "CAGCAGCAGTTC", params)
+```
+
+### Preserving Short-Homopolymer Signal (`hp_normalize_min_length`)
+
+By default, any homopolymer length difference is normalized to zero edits — the right choice when comparing sequences from noisy technologies (e.g., nanopore) where HP length error dominates. However, empirical measurement on current Oxford Nanopore R10.4.1 chemistry shows that short homopolymer runs (lengths 1–5) have per-position error rates comparable to the non-HP substitution baseline, meaning length differences at these lengths are more likely biological than technical.
+
+`hp_normalize_min_length` lets you keep blanket-normalization for long HP runs (where errors dominate) while treating short-HP length differences as real edits:
+
+```python
+from adjusted_identity import align_and_score, AdjustmentParams
+
+# Default: every HP length difference is normalized (backward compatible)
+r_default = align_and_score("GCGCAAAGCGC", "GCGCAAAAGCGC")
+print(f"Default identity: {r_default.identity:.3f}")  # 1.000
+
+# With hp_normalize_min_length=6, the AAA-vs-AAAA diff (max run=4) counts as an edit
+params = AdjustmentParams(hp_normalize_min_length=6)
+r_strict = align_and_score("GCGCAAAGCGC", "GCGCAAAAGCGC", params)
+print(f"Strict identity:  {r_strict.identity:.3f}")   # 0.917
+
+# Long HP runs still normalize (min run length >= 6)
+r_long = align_and_score("GCGCAAAAAAGCGC", "GCGCAAAAAAAGCGC", params)
+print(f"Long-HP identity: {r_long.identity:.3f}")     # 1.000
+```
+
+**Semantics:** the shorter side's HP run length is compared against the threshold. If `min(L1, L2) < hp_normalize_min_length`, the diff counts as an edit (respecting `normalize_indels`). Applies only to true homopolymers (motif length 1) — dinucleotide and longer repeat extensions remain unaffected.
+
+**When to use:** callers performing specimen-to-specimen comparison of consensus sequences where short-HP variation carries phylogenetic signal. Leave at the default (`1`) for raw-read or read-to-consensus comparison where HP error dominates.
+
+**Visualization:** demoted positions render with `ScoringFormat.short_hp_edit` (default `' '` — a space, matching other scored mismatches). Override for a debug-visible marker:
+
+```python
+from adjusted_identity import ScoringFormat
+fmt = ScoringFormat(short_hp_edit='x')
+result = align_and_score("GCGCAAAGCGC", "GCGCAAAAGCGC",
+                         AdjustmentParams(hp_normalize_min_length=6), fmt)
+print(result.score_aligned)  # "|||||||x||||"
 ```
 
 ### Multi-Sequence Alignment (MSA) Support
@@ -365,7 +402,8 @@ AdjustmentParams(
     normalize_indels=True,          # Count contiguous indels as single events
     end_skip_distance=0,           # Skip first/last N nucleotides (0 = disabled by default)
     max_repeat_motif_length=2,     # Maximum repeat motif length to detect (1=homopolymers only, 2=dinucleotides, etc.)
-    scoring_mode=ScoringMode.LOCAL # LOCAL (overlap only) or GLOBAL (full alignment with terminal gaps)
+    scoring_mode=ScoringMode.LOCAL, # LOCAL (overlap only) or GLOBAL (full alignment with terminal gaps)
+    hp_normalize_min_length=1,     # Minimum HP run length to normalize (1 = normalize all, matches previous behavior)
 )
 ```
 
@@ -381,6 +419,7 @@ ScoringFormat(
     indel_start=' ',               # First position of indel
     indel_extension='-',           # Indel positions (normalization)
     homopolymer_extension='=',     # Homopolymer length difference
+    short_hp_edit=' ',             # Short-HP length diff counted as edit (hp_normalize_min_length > 1)
     end_trimmed='.'               # Position outside scoring region
 )
 ```

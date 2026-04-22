@@ -199,7 +199,18 @@ When `normalize_indels=True`:
 | `True` (default) | Different IUPAC codes with intersection are equivalent |
 | `False` | IUPAC codes must match exactly (or one must be standard nucleotide) |
 
-### 6.4 Combined Effects
+### 6.4 hp_normalize_min_length
+
+| Value | Effect |
+|-------|--------|
+| `1` (default) | Every homopolymer length difference is normalized (matches pre-0.2.7 behavior) |
+| `N > 1` | If `min(L1, L2) < N` for a pure-extension variant range with motif length 1, the length difference is demoted to a counted edit (respects `normalize_indels`). Runs with `min(L1, L2) >= N` still normalize. |
+
+Applies only to true homopolymers (motif length 1). Dinucleotide and longer repeat extensions are unaffected. No effect when `normalize_homopolymers=False` (the HP branch is skipped entirely).
+
+`L1` / `L2` are measured in the aligned sequences as the total run of the HP base touching the variant range, counting non-gap characters and walking both into the left and right context. When both left- and right-side HP extensions of different bases are involved, a demote is triggered if either side's shorter run is below the threshold.
+
+### 6.5 Combined Effects
 
 | HP Norm | Indel Norm | Behavior |
 |---------|------------|----------|
@@ -219,12 +230,14 @@ When `normalize_indels=True`:
 | `\|` | Match (exact or IUPAC equivalent) | Yes |
 | `=` | Homopolymer/repeat extension OR ambiguous match (IUPAC intersection) | See note |
 | `-` | Indel extension (when normalize_homopolymers=False) | No |
-| ` ` (space) | Mismatch or indel start | Yes |
+| ` ` (space) | Mismatch, indel start, OR short-HP edit (when `hp_normalize_min_length > 1` demotes a short HP diff; field: `short_hp_edit`, default `' '`) | Yes |
 | `.` | End-trimmed position OR dual-gap (MSA artifact) | No |
 
 **Note on `=` marker**: The `=` character serves dual purposes:
 - Homopolymer/repeat extensions: Not scored (extensions don't count as mismatches)
 - Ambiguous IUPAC matches: Scored as a match position
+
+**Note on `short_hp_edit` marker**: Exposed as a separate `ScoringFormat` field so callers can override (e.g. `ScoringFormat(short_hp_edit='x')`) to distinguish demoted-HP edits from regular substitutions in visual output.
 
 ### 7.1.1 Dual-Gap Handling
 

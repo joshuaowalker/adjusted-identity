@@ -119,6 +119,7 @@ class ScoringFormat:
     indel_start: str = ' '              # First position of indel (scored)
     indel_extension: str = '-'          # Indel positions skipped due to normalization
     homopolymer_extension: str = '='    # Homopolymer length difference
+    short_hp_edit: str = ' '            # Short HP length diff counted as edit (below hp_normalize_min_length)
     end_trimmed: str = '.'              # Position outside scoring region (end trimmed)
     dual_gap: str = '.'                 # Both sequences have gap (MSA artifact, not scored)
     
@@ -143,6 +144,10 @@ class AdjustmentParams:
                           Set to 0 to disable end trimming completely.
         max_repeat_motif_length: Maximum length of repeat motifs to detect (e.g., 2 for dinucleotides).
                                 Set to 1 to only detect homopolymers, 2 for dinucleotides, etc.
+        hp_normalize_min_length: Minimum homopolymer run length at which HP normalization applies.
+                                When min(L1, L2) < this value for a homopolymer (motif length 1) run,
+                                the length difference is counted as an edit instead of being normalized.
+                                Default 1 normalizes all HP runs (matches pre-existing behavior).
     """
     normalize_homopolymers: bool = True      # Ignore homopolymer length differences
     handle_iupac_overlap: bool = True        # Allow different ambiguity codes to match via intersection
@@ -150,6 +155,7 @@ class AdjustmentParams:
     end_skip_distance: int = 0               # Nucleotides to skip from each end (0 = disabled by default)
     max_repeat_motif_length: int = 2         # Maximum repeat motif length to detect (default: dinucleotides)
     scoring_mode: ScoringMode = ScoringMode.LOCAL  # LOCAL scores overlap only; GLOBAL includes terminal gaps
+    hp_normalize_min_length: int = 1         # Min HP run length for normalization (1 = normalize all)
 
     def __post_init__(self):
         """Validate parameter combinations and coerce types."""
@@ -160,6 +166,10 @@ class AdjustmentParams:
             raise ValueError(
                 f"Contradictory configuration: normalize_homopolymers=True requires "
                 f"max_repeat_motif_length >= 1 to detect homopolymers, got {self.max_repeat_motif_length}"
+            )
+        if self.hp_normalize_min_length < 1:
+            raise ValueError(
+                f"hp_normalize_min_length must be >= 1, got {self.hp_normalize_min_length}"
             )
 
 
@@ -175,11 +185,15 @@ class AlleleAnalysis:
         right_extension_count: Number of characters consumed as right repeat extension
         core_content: Remaining characters not explained by repeat extensions
         is_pure_extension: True if entire allele is repeat extensions (core is empty)
+        left_motif_length: Length of motif used for left extension (1 = homopolymer, 0 = no extension)
+        right_motif_length: Length of motif used for right extension (1 = homopolymer, 0 = no extension)
     """
     left_extension_count: int
     right_extension_count: int
     core_content: str
     is_pure_extension: bool
+    left_motif_length: int = 0
+    right_motif_length: int = 0
 
 
 @dataclass(frozen=True)
@@ -657,6 +671,8 @@ def _analyze_allele(allele, left_context, right_context, max_motif_length, handl
     n = len(allele)
     left_consumed = 0
     right_consumed = 0
+    left_motif_len_used = 0
+    right_motif_len_used = 0
 
     # LEFT EXTENSION: Try different motif lengths (largest first)
     if left_context:
@@ -685,6 +701,7 @@ def _analyze_allele(allele, left_context, right_context, max_motif_length, handl
 
             if consumed > 0:
                 left_consumed = consumed
+                left_motif_len_used = motif_len
                 break
 
     # RIGHT EXTENSION: Try different motif lengths (largest first)
@@ -721,6 +738,7 @@ def _analyze_allele(allele, left_context, right_context, max_motif_length, handl
 
             if consumed > 0:
                 right_consumed = consumed
+                right_motif_len_used = motif_len
                 break
 
     # Core content is what remains (string slicing, no list conversion)
@@ -732,7 +750,9 @@ def _analyze_allele(allele, left_context, right_context, max_motif_length, handl
         left_extension_count=left_consumed,
         right_extension_count=right_consumed,
         core_content=core_content,
-        is_pure_extension=(len(core_content) == 0)
+        is_pure_extension=(len(core_content) == 0),
+        left_motif_length=left_motif_len_used,
+        right_motif_length=right_motif_len_used,
     )
 
 
@@ -801,7 +821,111 @@ def _find_variant_ranges(seq1_aligned, seq2_aligned, scoring_start, scoring_end,
     return variant_ranges
 
 
-def _score_variant_range(allele1, analysis1, allele2, analysis2, adjustment_params):
+def _hp_run_length(seq_aligned, vr_start, vr_end, base):
+    """
+    Count the length of the homopolymer run of `base` in `seq_aligned` that
+    spans and touches the variant range [vr_start, vr_end].
+
+    Walks left from vr_start-1 and right from vr_end+1, skipping gap columns
+    and counting consecutive non-gap occurrences of `base` (case-insensitive).
+    Also counts `base` chars within the variant range (skipping gaps).
+
+    Args:
+        seq_aligned: Aligned sequence with '-' for gaps
+        vr_start, vr_end: Variant range boundaries (inclusive)
+        base: The homopolymer base to measure (single character)
+
+    Returns:
+        Total number of `base` characters in the run, or 0 if `base` is empty.
+    """
+    if not base:
+        return 0
+    base_upper = base.upper()
+    n = len(seq_aligned)
+    count = 0
+
+    pos = vr_start - 1
+    while pos >= 0:
+        c = seq_aligned[pos]
+        if c == '-':
+            pos -= 1
+            continue
+        if c.upper() == base_upper:
+            count += 1
+            pos -= 1
+        else:
+            break
+
+    for pos in range(vr_start, vr_end + 1):
+        c = seq_aligned[pos]
+        if c == '-':
+            continue
+        if c.upper() == base_upper:
+            count += 1
+
+    pos = vr_end + 1
+    while pos < n:
+        c = seq_aligned[pos]
+        if c == '-':
+            pos += 1
+            continue
+        if c.upper() == base_upper:
+            count += 1
+            pos += 1
+        else:
+            break
+
+    return count
+
+
+def _short_hp_demote(allele1, analysis1, allele2, analysis2, adjustment_params,
+                     seq1_aligned, seq2_aligned, vr_start, vr_end):
+    """
+    Decide whether a homopolymer extension should be demoted to a counted edit
+    because the shorter side's HP run length is below hp_normalize_min_length.
+
+    Returns True only when motif length 1 (true homopolymer) extensions are
+    involved and min(L1, L2) < hp_normalize_min_length for any base used.
+    """
+    threshold = adjustment_params.hp_normalize_min_length
+    if threshold <= 1:
+        return False
+
+    bases_to_check = []
+
+    # Left-side HP base
+    left_allele = None
+    if analysis1.left_motif_length == 1 and analysis1.left_extension_count > 0:
+        left_allele = allele1
+    elif analysis2.left_motif_length == 1 and analysis2.left_extension_count > 0:
+        left_allele = allele2
+    if left_allele:
+        bases_to_check.append(left_allele[0])
+
+    # Right-side HP base
+    right_allele = None
+    if analysis1.right_motif_length == 1 and analysis1.right_extension_count > 0:
+        right_allele = allele1
+    elif analysis2.right_motif_length == 1 and analysis2.right_extension_count > 0:
+        right_allele = allele2
+    if right_allele:
+        b = right_allele[-1]
+        if b not in bases_to_check:
+            bases_to_check.append(b)
+
+    if not bases_to_check:
+        return False
+
+    for base in bases_to_check:
+        L1 = _hp_run_length(seq1_aligned, vr_start, vr_end, base)
+        L2 = _hp_run_length(seq2_aligned, vr_start, vr_end, base)
+        if min(L1, L2) < threshold:
+            return True
+    return False
+
+
+def _score_variant_range(allele1, analysis1, allele2, analysis2, adjustment_params,
+                         seq1_aligned, seq2_aligned, vr_start, vr_end):
     """
     Score a variant range given two allele analyses using Occam's razor.
 
@@ -813,16 +937,23 @@ def _score_variant_range(allele1, analysis1, allele2, analysis2, adjustment_para
     When normalize_homopolymers=False:
     - Extensions are treated as regular indels
 
+    When hp_normalize_min_length > 1 and the shorter HP run is below that
+    length, a pure-extension variant range is demoted back to a regular indel
+    edit (flagged with short_hp_edit=True) instead of being normalized.
+
     Args:
         allele1, allele2: The allele strings
         analysis1, analysis2: AlleleAnalysis for each allele
         adjustment_params: AdjustmentParams for scoring behavior
+        seq1_aligned, seq2_aligned: Full aligned sequences (for HP run-length walks)
+        vr_start, vr_end: Variant range boundaries (inclusive)
 
     Returns:
         dict: {
             'edits': int,
             'scored_positions': int,
-            'both_pure_extension': bool
+            'both_pure_extension': bool,
+            'short_hp_edit': bool
         }
     """
     # When homopolymer normalization is disabled, treat extensions as indels
@@ -830,27 +961,45 @@ def _score_variant_range(allele1, analysis1, allele2, analysis2, adjustment_para
         # Total content from both alleles (treating as a regular indel region)
         total_len = max(len(allele1), len(allele2))
         if total_len == 0:
-            return {'edits': 0, 'scored_positions': 0, 'both_pure_extension': False}
+            return {'edits': 0, 'scored_positions': 0, 'both_pure_extension': False, 'short_hp_edit': False}
 
         if adjustment_params.normalize_indels:
             return {
                 'edits': 1,
                 'scored_positions': 1,
-                'both_pure_extension': False
+                'both_pure_extension': False,
+                'short_hp_edit': False,
             }
         else:
             return {
                 'edits': total_len,
                 'scored_positions': total_len,
-                'both_pure_extension': False
+                'both_pure_extension': False,
+                'short_hp_edit': False,
             }
+
+    # Short-HP threshold check: if the shorter HP run is below the configured
+    # minimum, demote pure-extension variant ranges to a counted edit. Applies
+    # to pure-extension cases only (where the length diff would otherwise
+    # normalize to 0 edits).
+    pure_ext_case = (analysis1.is_pure_extension or analysis2.is_pure_extension)
+    if pure_ext_case and _short_hp_demote(allele1, analysis1, allele2, analysis2,
+                                          adjustment_params,
+                                          seq1_aligned, seq2_aligned, vr_start, vr_end):
+        total_len = max(len(allele1), len(allele2))
+        if total_len == 0:
+            return {'edits': 0, 'scored_positions': 0, 'both_pure_extension': False, 'short_hp_edit': True}
+        if adjustment_params.normalize_indels:
+            return {'edits': 1, 'scored_positions': 1, 'both_pure_extension': False, 'short_hp_edit': True}
+        return {'edits': total_len, 'scored_positions': total_len, 'both_pure_extension': False, 'short_hp_edit': True}
 
     # Both pure extensions -> homopolymer equivalent
     if analysis1.is_pure_extension and analysis2.is_pure_extension:
         return {
             'edits': 0,
             'scored_positions': 0,
-            'both_pure_extension': True
+            'both_pure_extension': True,
+            'short_hp_edit': False,
         }
 
     # One pure extension, other has core -> count core as edits
@@ -860,13 +1009,15 @@ def _score_variant_range(allele1, analysis1, allele2, analysis2, adjustment_para
             return {
                 'edits': 1 if core else 0,
                 'scored_positions': 1 if core else 0,
-                'both_pure_extension': False
+                'both_pure_extension': False,
+                'short_hp_edit': False,
             }
         else:
             return {
                 'edits': len(core),
                 'scored_positions': len(core),
-                'both_pure_extension': False
+                'both_pure_extension': False,
+                'short_hp_edit': False,
             }
 
     if analysis2.is_pure_extension:
@@ -875,13 +1026,15 @@ def _score_variant_range(allele1, analysis1, allele2, analysis2, adjustment_para
             return {
                 'edits': 1 if core else 0,
                 'scored_positions': 1 if core else 0,
-                'both_pure_extension': False
+                'both_pure_extension': False,
+                'short_hp_edit': False,
             }
         else:
             return {
                 'edits': len(core),
                 'scored_positions': len(core),
-                'both_pure_extension': False
+                'both_pure_extension': False,
+                'short_hp_edit': False,
             }
 
     # Both have core -> compare cores
@@ -892,7 +1045,8 @@ def _score_variant_range(allele1, analysis1, allele2, analysis2, adjustment_para
         return {
             'edits': 0,
             'scored_positions': len(core1),
-            'both_pure_extension': False
+            'both_pure_extension': False,
+            'short_hp_edit': False,
         }
 
     # Cores differ - compute edit count
@@ -919,13 +1073,14 @@ def _score_variant_range(allele1, analysis1, allele2, analysis2, adjustment_para
     return {
         'edits': substitutions + indel_edits,
         'scored_positions': min_len + indel_scored,
-        'both_pure_extension': False
+        'both_pure_extension': False,
+        'short_hp_edit': False,
     }
 
 
 def _generate_variant_score_string(seq1_aligned, seq2_aligned, start, end,
                                     analysis1, analysis2, allele1_positions, allele2_positions,
-                                    scoring_format, adjustment_params):
+                                    scoring_format, adjustment_params, score_result=None):
     """
     Generate score_aligned string for a variant range.
 
@@ -933,6 +1088,8 @@ def _generate_variant_score_string(seq1_aligned, seq2_aligned, start, end,
     - Extension positions show extension marker (=)
     - Core positions show match (|) if cores match, mismatch ( ) if they differ
     - Gap positions show extension marker if the other sequence is an extension
+    - When score_result['short_hp_edit'] is True, extension positions use the
+      short_hp_edit marker instead of homopolymer_extension
 
     Args:
         seq1_aligned, seq2_aligned: Aligned sequences
@@ -941,6 +1098,7 @@ def _generate_variant_score_string(seq1_aligned, seq2_aligned, start, end,
         allele1_positions, allele2_positions: Source positions for each allele's chars
         scoring_format: ScoringFormat for visualization
         adjustment_params: AdjustmentParams for scoring behavior
+        score_result: Scoring dict from _score_variant_range (for short_hp_edit flag)
 
     Returns:
         str: Score visualization string for this variant range
@@ -959,9 +1117,16 @@ def _generate_variant_score_string(seq1_aligned, seq2_aligned, start, end,
     # Determine if cores match (for visualization - matched cores show as |)
     cores_match = analysis1.core_content == analysis2.core_content
 
-    # Choose extension marker based on normalization settings
-    ext_marker = (scoring_format.homopolymer_extension if adjustment_params.normalize_homopolymers
-                  else scoring_format.indel_extension)
+    # Choose extension marker based on normalization settings. When the short-HP
+    # threshold demoted this variant range to a counted edit, render extension
+    # positions with short_hp_edit so the visualization matches the scoring.
+    short_hp_demoted = bool(score_result and score_result.get('short_hp_edit'))
+    if short_hp_demoted:
+        ext_marker = scoring_format.short_hp_edit
+    elif adjustment_params.normalize_homopolymers:
+        ext_marker = scoring_format.homopolymer_extension
+    else:
+        ext_marker = scoring_format.indel_extension
 
     # Generate visualization
     score_chars = []
@@ -1161,7 +1326,8 @@ def _analyze_alignment(seq1_aligned, seq2_aligned, adjustment_params=None):
 
         # Score the variant range
         vr_score = _score_variant_range(
-            allele1, analysis1, allele2, analysis2, adjustment_params
+            allele1, analysis1, allele2, analysis2, adjustment_params,
+            seq1_aligned, seq2_aligned, vr_start, vr_end
         )
 
         edits += vr_score['edits']
@@ -1315,10 +1481,15 @@ def _adjust_alignment_gaps(seq1_aligned, seq2_aligned, analysis, adjustment_para
         adjustment_params: AdjustmentParams for scoring behavior
 
     Returns:
-        tuple: (adjusted_seq1, adjusted_seq2) strings
+        tuple: (adjusted_seq1, adjusted_seq2, demoted_spans)
+            demoted_spans is a list of (adj_start, adj_end_inclusive) tuples for
+            variant ranges demoted by the short-HP threshold. Callers that don't
+            need it can unpack only the first two items.
     """
     result_seq1 = []
     result_seq2 = []
+    demoted_spans = []
+    adj_offset = 0
 
     # Build lookup for variant range start positions
     vr_by_start = {vr.start: vr for vr in analysis.variant_ranges}
@@ -1332,6 +1503,7 @@ def _adjust_alignment_gaps(seq1_aligned, seq2_aligned, analysis, adjustment_para
         if pos < analysis.scoring_start or pos > analysis.scoring_end:
             result_seq1.append(seq1_aligned[pos])
             result_seq2.append(seq2_aligned[pos])
+            adj_offset += 1
             pos += 1
             continue
 
@@ -1345,6 +1517,11 @@ def _adjust_alignment_gaps(seq1_aligned, seq2_aligned, analysis, adjustment_para
             result_seq1.append(adj_seq1)
             result_seq2.append(adj_seq2)
 
+            vr_adj_len = len(adj_seq1)
+            if vr_info.score_result.get('short_hp_edit'):
+                demoted_spans.append((adj_offset, adj_offset + vr_adj_len - 1))
+            adj_offset += vr_adj_len
+
             # Skip to end of variant range
             pos = vr_end + 1
             continue
@@ -1352,9 +1529,10 @@ def _adjust_alignment_gaps(seq1_aligned, seq2_aligned, analysis, adjustment_para
         # Match position or dual-gap: emit as-is
         result_seq1.append(seq1_aligned[pos])
         result_seq2.append(seq2_aligned[pos])
+        adj_offset += 1
         pos += 1
 
-    return ''.join(result_seq1), ''.join(result_seq2)
+    return ''.join(result_seq1), ''.join(result_seq2), demoted_spans
 
 
 def _generate_annotated_score_string(seq1_aligned, seq2_aligned, analysis, adjustment_params, scoring_format):
@@ -1396,7 +1574,7 @@ def _generate_annotated_score_string(seq1_aligned, seq2_aligned, analysis, adjus
                 seq1_aligned, seq2_aligned, vr_info.start, vr_info.end,
                 vr_info.analysis1, vr_info.analysis2,
                 vr_info.allele1_positions, vr_info.allele2_positions,
-                scoring_format, adjustment_params
+                scoring_format, adjustment_params, vr_info.score_result
             )
             score_chars.append(vr_score_str)
 
@@ -1458,7 +1636,8 @@ def _generate_annotated_output(seq1_aligned, seq2_aligned, analysis, adjustment_
     )
 
 
-def _generate_adjusted_score_string(adj_seq1, adj_seq2, analysis, adjustment_params, scoring_format):
+def _generate_adjusted_score_string(adj_seq1, adj_seq2, analysis, adjustment_params, scoring_format,
+                                     demoted_spans=None):
     """
     Generate intuitive score string for gap-adjusted alignment.
 
@@ -1468,18 +1647,27 @@ def _generate_adjusted_score_string(adj_seq1, adj_seq2, analysis, adjustment_par
     - Extension positions show extension marker (=)
     - Core positions show match (|) or mismatch ( )
     - Match positions show match (|) or ambiguous match (=)
+    - Positions inside a short-HP demoted variant range use short_hp_edit
 
     Args:
         adj_seq1, adj_seq2: Gap-adjusted aligned sequences
         analysis: AlignmentAnalysis from _analyze_alignment
         adjustment_params: AdjustmentParams for scoring behavior
         scoring_format: ScoringFormat for visualization
+        demoted_spans: List of (adj_start, adj_end) inclusive tuples flagging
+                       variant ranges demoted by the short-HP threshold.
 
     Returns:
         str: Scoring visualization string for adjusted alignment
     """
     adj_length = len(adj_seq1)
     score_chars = []
+
+    demoted_set = set()
+    if demoted_spans:
+        for s, e in demoted_spans:
+            for p in range(s, e + 1):
+                demoted_set.add(p)
 
     # Adjusted alignment may have different length than original
     # We need to track position mapping through the adjustment
@@ -1511,7 +1699,9 @@ def _generate_adjusted_score_string(adj_seq1, adj_seq2, analysis, adjustment_par
 
         # One has content, one has gap - this is an extension or core indel position
         # In the adjusted alignment, gaps adjacent to matching context are extensions
-        if adjustment_params.normalize_homopolymers:
+        if pos in demoted_set:
+            score_chars.append(scoring_format.short_hp_edit)
+        elif adjustment_params.normalize_homopolymers:
             score_chars.append(scoring_format.homopolymer_extension)
         else:
             score_chars.append(scoring_format.indel_extension)
@@ -1536,13 +1726,14 @@ def _generate_adjusted_output(seq1_aligned, seq2_aligned, analysis, adjustment_p
         AlignmentResult: Result with adjusted alignment strings and intuitive score string
     """
     # Adjust the alignment gaps using the analysis
-    adj_seq1, adj_seq2 = _adjust_alignment_gaps(
+    adj_seq1, adj_seq2, demoted_spans = _adjust_alignment_gaps(
         seq1_aligned, seq2_aligned, analysis, adjustment_params
     )
 
     # Generate score string for the adjusted alignment
     score_aligned = _generate_adjusted_score_string(
-        adj_seq1, adj_seq2, analysis, adjustment_params, scoring_format
+        adj_seq1, adj_seq2, analysis, adjustment_params, scoring_format,
+        demoted_spans=demoted_spans
     )
 
     return AlignmentResult(

@@ -88,6 +88,7 @@ twine upload dist/*
 
 3. **Adjustment Features**:
    - Homopolymer length normalization - ignores differences in homopolymer run lengths
+   - Short-HP threshold (`hp_normalize_min_length`) - opt in to counting length diffs in short HP runs as real edits (default 1 = normalize all)
    - IUPAC ambiguity code handling - allows different ambiguity codes to match
    - End trimming - skips mismatches in terminal regions (disabled by default, set `end_skip_distance` to enable)
    - Indel normalization - counts contiguous indels as single events
@@ -113,6 +114,7 @@ The test suite is comprehensive and serves as documentation:
    - `TestEdgeCases` - Error conditions and edge cases
    - `TestDocumentationExamples` - Real-world usage examples
    - `TestScoringMode` - LOCAL vs GLOBAL scoring mode comparisons
+   - `TestShortHomopolymerThreshold` - `hp_normalize_min_length` threshold behavior
 
 2. **test_alignment.py**: Alignment algorithm tests
    - `TestAlignEdlibBidirectional` - Bidirectional alignment
