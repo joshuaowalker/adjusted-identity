@@ -304,6 +304,9 @@ def _are_nucleotides_equivalent(nuc1, nuc2, enable_iupac_intersection=True):
     """
     Check if two nucleotides are equivalent according to IUPAC ambiguity codes.
 
+    Results are memoized: the character alphabet is tiny, and this function is
+    called in scoring hot loops, so lookups hit the cache almost always.
+
     Args:
         nuc1 (str): First nucleotide (single character)
         nuc2 (str): Second nucleotide (single character)
@@ -314,6 +317,19 @@ def _are_nucleotides_equivalent(nuc1, nuc2, enable_iupac_intersection=True):
             - is_match: True if nucleotides are equivalent
             - is_ambiguous: True if match involves ambiguity codes (not exact A=A, C=C, G=G, T=T)
     """
+    key = (nuc1, nuc2, enable_iupac_intersection)
+    cached = _NUC_EQUIV_CACHE.get(key)
+    if cached is None:
+        cached = _compute_nucleotides_equivalent(nuc1, nuc2, enable_iupac_intersection)
+        _NUC_EQUIV_CACHE[key] = cached
+    return cached
+
+
+_NUC_EQUIV_CACHE = {}
+
+
+def _compute_nucleotides_equivalent(nuc1, nuc2, enable_iupac_intersection):
+    """Uncached implementation backing _are_nucleotides_equivalent."""
     # Fast path: exact match (case-sensitive) - most common case
     if nuc1 == nuc2:
         return (True, nuc1 not in _STANDARD_NUCS_AND_GAP)
@@ -508,18 +524,19 @@ def _extract_left_context(seq1_aligned, seq2_aligned, position, length):
     Args:
         seq1_aligned, seq2_aligned: Aligned sequences with gaps
         position: Starting position (exclusive, work backward from here)
-        length: Number of nucleotide characters to extract
+        length: Maximum number of nucleotide characters to extract
 
     Returns:
-        str: Context string in left-to-right order (e.g., "AAA"), or None if:
-            - Insufficient context available (fewer than 'length' chars)
-            - Hit another variant range (non-match position)
+        str: Context string in left-to-right order (e.g., "AAA") containing up
+            to 'length' characters - shorter if the sequence start or another
+            variant range (non-match position) is reached first - or None if
+            no context characters are available at all.
 
     Examples:
         >>> _extract_left_context("AGG-AC", "AG-GAC", 2, 1)
         'G'  # Position 1 is a match
         >>> _extract_left_context("AGT-AC", "AX-GAC", 2, 1)
-        None  # Position 1 is not a match (G vs X)
+        None  # Position 1 is not a match (G vs X), no context available
     """
     context_chars = []
     pos = position - 1
@@ -542,9 +559,9 @@ def _extract_left_context(seq1_aligned, seq2_aligned, position, length):
             continue
 
         # Any other case: we've hit a variant range (gap or mismatch)
-        return None
+        break
 
-    if collected < length:
+    if not context_chars:
         return None
 
     return ''.join(reversed(context_chars))
@@ -565,18 +582,19 @@ def _extract_right_context(seq1_aligned, seq2_aligned, position, length):
     Args:
         seq1_aligned, seq2_aligned: Aligned sequences with gaps
         position: Starting position (exclusive, work forward from here)
-        length: Number of nucleotide characters to extract
+        length: Maximum number of nucleotide characters to extract
 
     Returns:
-        str: Context string in left-to-right order (e.g., "TTT"), or None if:
-            - Insufficient context available (fewer than 'length' chars)
-            - Hit another variant range (non-match position)
+        str: Context string in left-to-right order (e.g., "TTT") containing up
+            to 'length' characters - shorter if the sequence end or another
+            variant range (non-match position) is reached first - or None if
+            no context characters are available at all.
 
     Examples:
         >>> _extract_right_context("AGA--TT", "AGAT-TT", 4, 2)
         'TT'  # Positions 5-6 are matches
         >>> _extract_right_context("AGA--TC", "AGAT-TG", 4, 2)
-        None  # Position 6 is not a match (C vs G)
+        'T'  # Position 5 matches; position 6 is not a match (C vs G)
     """
     context_chars = []
     pos = position + 1
@@ -600,9 +618,9 @@ def _extract_right_context(seq1_aligned, seq2_aligned, position, length):
             continue
 
         # Any other case: we've hit a variant range (gap or mismatch)
-        return None
+        break
 
-    if collected < length:
+    if not context_chars:
         return None
 
     return ''.join(context_chars)
@@ -647,6 +665,10 @@ def _motif_matches(chunk, motif, handle_iupac):
     """
     if len(chunk) != len(motif):
         return False
+    # Fast path: identical strings always match (equal characters are
+    # equivalent regardless of IUPAC handling)
+    if chunk == motif:
+        return True
     for c1, c2 in zip(chunk, motif):
         is_match, _ = _are_nucleotides_equivalent(c1, c2, handle_iupac)
         if not is_match:
@@ -675,6 +697,23 @@ def _analyze_allele(allele, left_context, right_context, max_motif_length, handl
         return AlleleAnalysis(0, 0, '', True)  # Empty allele = pure extension
 
     n = len(allele)
+
+    # Fast path: single-character alleles (the most common case in divergent
+    # alignments - single substitution or single-base indel columns). Motifs
+    # longer than one character cannot consume a one-character allele, and the
+    # degenerate-motif collapse reduces same-character motifs to length 1, so
+    # extension testing reduces to comparing against the adjacent context
+    # character on each side.
+    if n == 1:
+        char = allele[0]
+        if left_context and _are_nucleotides_equivalent(
+                char, left_context[-1], handle_iupac)[0]:
+            return AlleleAnalysis(1, 0, '', True, 1, 0)
+        if right_context and _are_nucleotides_equivalent(
+                char, right_context[0], handle_iupac)[0]:
+            return AlleleAnalysis(0, 1, '', True, 0, 1)
+        return AlleleAnalysis(0, 0, allele, False, 0, 0)
+
     left_consumed = 0
     right_consumed = 0
     left_motif_len_used = 0
@@ -1249,12 +1288,6 @@ def _analyze_alignment(seq1_aligned, seq2_aligned, adjustment_params=None):
     edits = 0
     scored_positions = 0
 
-    # Calculate coverage
-    seq1_coverage_positions = 0
-    seq2_coverage_positions = 0
-    seq1_total_length = 0
-    seq2_total_length = 0
-
     # Find alignment bounds
     alignment_start = 0
     alignment_end = total_alignment_length - 1
@@ -1269,16 +1302,13 @@ def _analyze_alignment(seq1_aligned, seq2_aligned, adjustment_params=None):
             alignment_end = pos
             break
 
-    for pos in range(total_alignment_length):
-        if seq1_aligned[pos] != '-':
-            seq1_total_length += 1
-        if seq2_aligned[pos] != '-':
-            seq2_total_length += 1
-        if alignment_start <= pos <= alignment_end:
-            if seq1_aligned[pos] != '-':
-                seq1_coverage_positions += 1
-            if seq2_aligned[pos] != '-':
-                seq2_coverage_positions += 1
+    # Calculate coverage counts with C-level str.count instead of a per-char loop
+    seq1_total_length = total_alignment_length - seq1_aligned.count('-')
+    seq2_total_length = total_alignment_length - seq2_aligned.count('-')
+    span1 = seq1_aligned[alignment_start:alignment_end + 1]
+    span2 = seq2_aligned[alignment_start:alignment_end + 1]
+    seq1_coverage_positions = len(span1) - span1.count('-')
+    seq2_coverage_positions = len(span2) - span2.count('-')
 
     # Find scoring region
     scoring_start, scoring_end = _find_scoring_region(
@@ -1299,24 +1329,19 @@ def _analyze_alignment(seq1_aligned, seq2_aligned, adjustment_params=None):
         allele1, allele1_positions = _extract_allele(seq1_aligned, vr_start, vr_end)
         allele2, allele2_positions = _extract_allele(seq2_aligned, vr_start, vr_end)
 
-        # Get context
+        # Get context (helpers return the longest available context up to
+        # max_ctx_len characters, or None if none is available)
         max_ctx_len = adjustment_params.max_repeat_motif_length
         left_context = None
         right_context = None
 
         if left_bound >= 0:
-            for ctx_len in range(max_ctx_len, 0, -1):
-                left_context = _extract_left_context(
-                    seq1_aligned, seq2_aligned, vr_start, ctx_len)
-                if left_context is not None:
-                    break
+            left_context = _extract_left_context(
+                seq1_aligned, seq2_aligned, vr_start, max_ctx_len)
 
         if right_bound >= 0:
-            for ctx_len in range(max_ctx_len, 0, -1):
-                right_context = _extract_right_context(
-                    seq1_aligned, seq2_aligned, vr_end, ctx_len)
-                if right_context is not None:
-                    break
+            right_context = _extract_right_context(
+                seq1_aligned, seq2_aligned, vr_end, max_ctx_len)
 
         # Analyze alleles
         analysis1 = _analyze_allele(
@@ -1355,24 +1380,19 @@ def _analyze_alignment(seq1_aligned, seq2_aligned, adjustment_params=None):
         )
         variant_range_infos.append(vr_info)
 
-    # Count match positions outside variant ranges
-    pos = scoring_start
-    vr_index = 0
-    num_variant_ranges = len(raw_variant_ranges)
-
-    while pos <= scoring_end:
-        if vr_index < num_variant_ranges and pos == raw_variant_ranges[vr_index][0]:
-            # Skip variant range (already counted above)
-            pos = raw_variant_ranges[vr_index][1] + 1
-            vr_index += 1
-        else:
-            char1, char2 = seq1_aligned[pos], seq2_aligned[pos]
-            if char1 == '-' and char2 == '-':
-                # Dual-gap - not scored
-                pass
-            else:
-                scored_positions += 1
-            pos += 1
+    # Count match positions outside variant ranges, one segment at a time.
+    # Within a segment between variant ranges every column is either a match
+    # or a dual-gap, and a match column cannot contain '-', so dual-gap
+    # columns are exactly the '-' columns of seq1.
+    seg_start = scoring_start
+    for vr_start, vr_end, _, _ in raw_variant_ranges:
+        if vr_start > seg_start:
+            segment = seq1_aligned[seg_start:vr_start]
+            scored_positions += len(segment) - segment.count('-')
+        seg_start = vr_end + 1
+    if seg_start <= scoring_end:
+        segment = seq1_aligned[seg_start:scoring_end + 1]
+        scored_positions += len(segment) - segment.count('-')
 
     # Calculate coverage
     seq1_coverage = seq1_coverage_positions / seq1_total_length if seq1_total_length > 0 else 0.0
@@ -1562,50 +1582,58 @@ def _generate_annotated_score_string(seq1_aligned, seq2_aligned, analysis, adjus
     score_chars = []
 
     # Add end-trimmed markers for positions before scoring region
-    for _ in range(analysis.scoring_start):
-        score_chars.append(scoring_format.end_trimmed)
+    score_chars.append(scoring_format.end_trimmed * analysis.scoring_start)
 
-    # Build lookup for variant ranges by start position
-    vr_by_start = {vr.start: vr for vr in analysis.variant_ranges}
+    handle_iupac = adjustment_params.handle_iupac_overlap
+    match_marker = scoring_format.match
 
-    # Process positions in scoring region
-    pos = analysis.scoring_start
-    while pos <= analysis.scoring_end:
-        # Check if this position starts a variant range
-        if pos in vr_by_start:
-            vr_info = vr_by_start[pos]
+    def emit_match_segment(start, stop):
+        """Emit markers for columns [start, stop): all matches or dual-gaps.
 
-            # Generate score string for this variant range using existing function
-            vr_score_str = _generate_variant_score_string(
-                seq1_aligned, seq2_aligned, vr_info.start, vr_info.end,
-                vr_info.analysis1, vr_info.analysis2,
-                vr_info.allele1_positions, vr_info.allele2_positions,
-                scoring_format, adjustment_params, vr_info.score_result
-            )
-            score_chars.append(vr_score_str)
-
-            # Move past this variant range
-            pos = vr_info.end + 1
-        else:
-            # Match position or dual-gap
+        Fast path: when the segment slices are equal and contain only standard
+        nucleotides, every column is an exact match - emit in bulk. Otherwise
+        fall back to per-column classification (ambiguity codes, case
+        differences, dual-gaps).
+        """
+        seg1 = seq1_aligned[start:stop]
+        if seg1 == seq2_aligned[start:stop] and not (set(seg1) - _STANDARD_NUCS):
+            score_chars.append(match_marker * (stop - start))
+            return
+        for pos in range(start, stop):
             char1, char2 = seq1_aligned[pos], seq2_aligned[pos]
-
             if char1 == '-' and char2 == '-':
                 # Dual-gap (MSA artifact - not scored)
                 score_chars.append(scoring_format.dual_gap)
             else:
                 # Match position - check for ambiguous match
                 is_match, is_ambiguous = _are_nucleotides_equivalent(
-                    char1, char2, adjustment_params.handle_iupac_overlap)
+                    char1, char2, handle_iupac)
                 if is_ambiguous:
                     score_chars.append(scoring_format.ambiguous_match)
                 else:
-                    score_chars.append(scoring_format.match)
-            pos += 1
+                    score_chars.append(match_marker)
+
+    # Process the scoring region: variant ranges interleaved with match segments
+    seg_start = analysis.scoring_start
+    for vr_info in analysis.variant_ranges:
+        if vr_info.start > seg_start:
+            emit_match_segment(seg_start, vr_info.start)
+
+        # Generate score string for this variant range using existing function
+        vr_score_str = _generate_variant_score_string(
+            seq1_aligned, seq2_aligned, vr_info.start, vr_info.end,
+            vr_info.analysis1, vr_info.analysis2,
+            vr_info.allele1_positions, vr_info.allele2_positions,
+            scoring_format, adjustment_params, vr_info.score_result
+        )
+        score_chars.append(vr_score_str)
+        seg_start = vr_info.end + 1
+
+    if seg_start <= analysis.scoring_end:
+        emit_match_segment(seg_start, analysis.scoring_end + 1)
 
     # Add end-trimmed markers for positions after scoring region
-    for _ in range(analysis.scoring_end + 1, total_length):
-        score_chars.append(scoring_format.end_trimmed)
+    score_chars.append(scoring_format.end_trimmed * (total_length - 1 - analysis.scoring_end))
 
     return ''.join(score_chars)
 
@@ -1943,9 +1971,11 @@ def align_edlib_bidirectional(seq1, seq2):
             if not rc_seq1 or not rc_seq2:
                 return None
 
-    # Step 5: Reverse complement back to forward orientation
-    current_seq1 = _reverse_complement(rc_seq1)
-    current_seq2 = _reverse_complement(rc_seq2)
+    # Step 5: Back to forward orientation. Trimming the RC suffix is equivalent
+    # to trimming the forward prefix, so slice the originals instead of paying
+    # for two more reverse-complement passes.
+    current_seq1 = seq1[seq1_prefix_trimmed:]
+    current_seq2 = seq2[seq2_prefix_trimmed:]
 
     # Step 6: Final forward alignment with task=path
     result = edlib.align(current_seq1, current_seq2, mode="HW", task="path")

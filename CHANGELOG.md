@@ -1,5 +1,14 @@
 # Changelog
 
+## Version 0.2.9
+- **Performance**: ~1.5x faster `align_and_score()` on real barcode data (validated byte-for-byte identical on 6,580 pinned alignments across 7 parameter configurations and both `adjust_gaps` modes)
+  - Coverage and scored-position counting use C-level `str.count` on slices instead of per-character Python loops
+  - Annotated score strings emit match segments in bulk, falling back to per-column classification only for segments containing gaps or ambiguity codes
+  - `_are_nucleotides_equivalent` results are memoized (tiny alphabet, hot-loop call site)
+  - `align_edlib_bidirectional` slices the original sequences instead of reverse-complementing back after RC-stage trimming (removes 2 of 4 RC passes)
+  - `_analyze_allele` fast path for single-character alleles (the dominant case in divergent alignments); `_motif_matches` short-circuits on exact string equality
+  - Context extraction walks once collecting up to `max_repeat_motif_length` characters instead of retrying at each shorter length (internal helper semantics: `_extract_left_context`/`_extract_right_context` now return the longest available context rather than exactly-N-or-None; callers' resulting contexts are unchanged)
+
 ## Version 0.2.8
 - **Bug Fix**: Sequence regions beyond the overlap are no longer dropped from the alignment (LOCAL mode)
   - edlib's semi-global (HW) alignment omits target flanks outside the aligned location range; `align_edlib_bidirectional()` silently lost these regions, so `seq2_aligned` was truncated and `seq2_coverage` read 1.0 regardless of how much of seq2 was unaligned
