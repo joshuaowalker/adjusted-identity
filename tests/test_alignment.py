@@ -268,3 +268,81 @@ class TestGlobalModeEndToEnd:
         params = AdjustmentParams(scoring_mode=ScoringMode.GLOBAL)
         result = align_and_score("", "ATCG", params)
         assert result.identity == 0.0
+
+class TestFlankReattachment:
+    """Sequence regions beyond the overlap must be preserved in the alignment.
+
+    Regression tests: edlib HW alignment omits target (seq2) regions outside
+    the aligned location range from getNiceAlignment output. Previously these
+    flanks were silently dropped from seq2_aligned, so seq2_coverage read 1.0
+    no matter how much of seq2 was unaligned, and coverage was asymmetric
+    between align_and_score(a, b) and align_and_score(b, a).
+    """
+
+    def test_seq2_tail_overhang(self):
+        """seq2 extending beyond seq1's 3' end must appear in the alignment."""
+        result = align_and_score("AAATTTGGG", "AAATTTGGGCCCCC")
+        assert result.seq1_aligned == "AAATTTGGG-----"
+        assert result.seq2_aligned == "AAATTTGGGCCCCC"
+        assert result.identity == 1.0
+        assert result.seq1_coverage == 1.0
+        assert result.seq2_coverage == pytest.approx(9 / 14)
+
+    def test_seq2_head_overhang(self):
+        """seq2 extending beyond seq1's 5' end must appear in the alignment."""
+        result = align_and_score("AAATTTGGG", "CCCCCAAATTTGGG")
+        assert result.seq1_aligned == "-----AAATTTGGG"
+        assert result.seq2_aligned == "CCCCCAAATTTGGG"
+        assert result.identity == 1.0
+        assert result.seq1_coverage == 1.0
+        assert result.seq2_coverage == pytest.approx(9 / 14)
+
+    def test_staggered_overhangs(self):
+        """Both sequences overhanging opposite ends must both be preserved."""
+        result = align_and_score("CCCCCAAATTTGGG", "AAATTTGGGAAAAA")
+        assert result.seq1_aligned == "CCCCCAAATTTGGG-----"
+        assert result.seq2_aligned == "-----AAATTTGGGAAAAA"
+        assert result.identity == 1.0
+        assert result.seq1_coverage == pytest.approx(9 / 14)
+        assert result.seq2_coverage == pytest.approx(9 / 14)
+
+    def test_coverage_symmetric_under_argument_swap(self):
+        """Coverage must be consistent whichever argument has the overhang."""
+        pairs = [
+            ("AAATTTGGG", "AAATTTGGGCCCCC"),
+            ("AAATTTGGG", "CCCCCAAATTTGGG"),
+            ("CCCCCAAATTTGGG", "AAATTTGGGAAAAA"),
+        ]
+        for seq_a, seq_b in pairs:
+            forward = align_and_score(seq_a, seq_b)
+            reverse = align_and_score(seq_b, seq_a)
+            assert forward.seq1_coverage == pytest.approx(reverse.seq2_coverage)
+            assert forward.seq2_coverage == pytest.approx(reverse.seq1_coverage)
+            assert forward.identity == pytest.approx(reverse.identity)
+
+    def test_biological_content_preserved_with_overhangs(self):
+        """Aligned strings must contain every input nucleotide."""
+        seq1, seq2 = "CCCCCAAATTTGGG", "AAATTTGGGAAAAA"
+        result = align_and_score(seq1, seq2)
+        assert result.seq1_aligned.replace('-', '') == seq1
+        assert result.seq2_aligned.replace('-', '') == seq2
+
+
+class TestDissimilarSequenceFailure:
+    """Completely dissimilar sequences must fail gracefully, not raise.
+
+    Regression test: when the RC-stage CIGAR reported the entire query as a
+    terminal insertion, trimming emptied one sequence and the forward
+    alignment crashed inside edlib.getNiceAlignment.
+    """
+
+    def test_align_and_score_returns_failure_sentinel(self):
+        result = align_and_score("AAAAAAAAAA", "TTTTTTTTTT")
+        assert result.identity == 0.0
+        assert result.mismatches == -1  # alignment-failure sentinel
+        assert result.scored_positions == 0
+        assert result.seq1_aligned == ""
+        assert result.seq2_aligned == ""
+
+    def test_bidirectional_returns_none(self):
+        assert align_edlib_bidirectional("AAAAAAAAAA", "TTTTTTTTTT") is None

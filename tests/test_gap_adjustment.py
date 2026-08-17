@@ -119,6 +119,34 @@ class TestScoringStringOptimality:
                 assert gaps == 1, \
                     f"Position {i}: extension marker '=' should have 1 gap, got {gaps} ({c1}/{c2})"
 
+    def test_core_indel_marked_as_edit_not_extension(self):
+        """A counted core indel must not be rendered with the extension marker.
+
+        Regression: adjust_gaps=True rendered every single-gap column as '='
+        (homopolymer extension, i.e. "normalized away, zero cost") even when
+        the variant range's core content was counted as an edit, contradicting
+        the returned metrics. CCC here is core content (extends nothing) and
+        scores as one normalized indel edit, so it must show indel markers.
+        """
+        result = align_and_score("AAACCCTTT", "AAATTT", adjust_gaps=True)
+
+        assert result.mismatches == 1
+        assert result.identity == pytest.approx(6 / 7)
+        # Same rendering as annotated mode: indel_start then indel_extension
+        assert result.score_aligned == "||| --|||"
+
+        annotated = align_and_score("AAACCCTTT", "AAATTT", adjust_gaps=False)
+        assert annotated.score_aligned == result.score_aligned
+
+    def test_core_indel_markers_without_indel_normalization(self):
+        """With normalize_indels=False every core indel column is a counted edit."""
+        params = AdjustmentParams(normalize_indels=False)
+        result = align_and_score("AAACCCTTT", "AAATTT", params, adjust_gaps=True)
+
+        assert result.mismatches == 3
+        # Each gap column is an individually counted edit (indel_start marker)
+        assert result.score_aligned == "|||   |||"
+
     def test_match_markers_have_no_gaps(self):
         """Match positions should have content in both sequences."""
         result = score_alignment("ATCGATCG", "ATCGATCG", adjust_gaps=True)
@@ -628,13 +656,18 @@ class TestDinucleotideGapAdjustment:
             assert len(result.seq1_aligned) == len(result.seq2_aligned) == len(result.score_aligned), \
                 f"Length mismatch for {seq1} vs {seq2}"
 
-    def test_annotated_vs_adjusted_score_strings_differ_for_mixed_case(self):
-        """Adjusted score string should differ from annotated for mixed indels.
+    def test_adjusted_score_string_marks_core_edit_for_mixed_case(self):
+        """Adjusted score string should mark counted core indels as edits.
 
-        When a variant range has both extensions and core content, the annotated
-        output (adjust_gaps=False) shows the core as a mismatch marker while the
-        adjusted output (adjust_gaps=True) rewrites gap positions so each position
-        is individually interpretable.
+        When a variant range has both extensions and core content, the adjusted
+        output (adjust_gaps=True) must render the counted core indel with the
+        indel_start marker (' ') and only the normalized repeat extensions with
+        '=', matching the returned metrics. (Regression: core indels were
+        previously rendered as '=' as if they had been normalized away.)
+
+        Here the input alignment already has contiguous gaps, so annotated and
+        adjusted output coincide: AT extends the AT dinucleotide context, the
+        trailing G extends the G context, and the core C is one counted edit.
         """
         params = AdjustmentParams(max_repeat_motif_length=2)
         result_false = score_alignment("ATAT----GGG", "ATATATCGGGG", params, adjust_gaps=False)
@@ -643,10 +676,11 @@ class TestDinucleotideGapAdjustment:
         # Metrics must be identical
         assert result_false.identity == result_true.identity
         assert result_false.mismatches == result_true.mismatches
+        assert result_true.mismatches == 1
 
-        # But score strings differ: annotated has ' ' and '-' for indel positions,
-        # adjusted rewrites them so each position has a clear interpretation
-        assert result_false.score_aligned != result_true.score_aligned
+        # Core 'C' shown as counted indel (' '), extensions as '=' in both modes
+        assert result_false.score_aligned == "||||== =|||"
+        assert result_true.score_aligned == "||||== =|||"
 
     def test_align_and_score_dinucleotide(self):
         """align_and_score should handle dinucleotide repeats with adjust_gaps=True."""

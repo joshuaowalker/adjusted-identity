@@ -139,7 +139,11 @@ class AdjustmentParams:
         normalize_homopolymers: Ignore homopolymer length differences (e.g., "AAA" vs "AAAA")
         handle_iupac_overlap: Allow different ambiguity codes to match via nucleotide intersection
         normalize_indels: Count contiguous indels as single evolutionary events
-        end_skip_distance: Number of nucleotides (not positions) to skip from each sequence end.
+        end_skip_distance: End-trimming distance in nucleotides (not alignment positions).
+                          Scoring begins/ends at the position where both sequences have
+                          reached their end_skip_distance-th nucleotide from that end,
+                          so the first/last end_skip_distance - 1 nucleotides of each
+                          sequence are excluded from scoring.
                           Only activates when sequences have ≥ 2×end_skip_distance nucleotides.
                           Set to 0 to disable end trimming completely.
         max_repeat_motif_length: Maximum length of repeat motifs to detect (e.g., 2 for dinucleotides).
@@ -398,9 +402,11 @@ def _find_scoring_region(seq1_aligned, seq2_aligned, adjustment_params):
     """
     Find the [start, end] region of the alignment where mismatches should be counted.
 
-    Implements MycoBLAST "digital end trimming" by skipping the first/last end_skip_distance
-    nucleotides (not alignment positions) from each sequence to avoid counting sequencing
-    artifacts near read ends.
+    Implements MycoBLAST "digital end trimming" by starting/ending the scoring region
+    at the position where both sequences have reached their end_skip_distance-th
+    nucleotide (not alignment position) from that end - i.e., the first/last
+    end_skip_distance - 1 nucleotides of each sequence are excluded - to avoid
+    counting sequencing artifacts near read ends.
 
     Scoring modes:
     - LOCAL + end_skip_distance=0: Score only overlap region (both sequences have content)
@@ -1481,14 +1487,15 @@ def _adjust_alignment_gaps(seq1_aligned, seq2_aligned, analysis, adjustment_para
         adjustment_params: AdjustmentParams for scoring behavior
 
     Returns:
-        tuple: (adjusted_seq1, adjusted_seq2, demoted_spans)
-            demoted_spans is a list of (adj_start, adj_end_inclusive) tuples for
-            variant ranges demoted by the short-HP threshold. Callers that don't
-            need it can unpack only the first two items.
+        tuple: (adjusted_seq1, adjusted_seq2, vr_spans)
+            vr_spans is a list of (adj_start, adj_end_inclusive, vr_info) tuples
+            mapping each variant range to its position span in the adjusted
+            alignment, used to render gap columns according to how they were
+            scored (extension vs. counted core indel vs. short-HP demotion).
     """
     result_seq1 = []
     result_seq2 = []
-    demoted_spans = []
+    vr_spans = []
     adj_offset = 0
 
     # Build lookup for variant range start positions
@@ -1518,8 +1525,7 @@ def _adjust_alignment_gaps(seq1_aligned, seq2_aligned, analysis, adjustment_para
             result_seq2.append(adj_seq2)
 
             vr_adj_len = len(adj_seq1)
-            if vr_info.score_result.get('short_hp_edit'):
-                demoted_spans.append((adj_offset, adj_offset + vr_adj_len - 1))
+            vr_spans.append((adj_offset, adj_offset + vr_adj_len - 1, vr_info))
             adj_offset += vr_adj_len
 
             # Skip to end of variant range
@@ -1532,7 +1538,7 @@ def _adjust_alignment_gaps(seq1_aligned, seq2_aligned, analysis, adjustment_para
         adj_offset += 1
         pos += 1
 
-    return ''.join(result_seq1), ''.join(result_seq2), demoted_spans
+    return ''.join(result_seq1), ''.join(result_seq2), vr_spans
 
 
 def _generate_annotated_score_string(seq1_aligned, seq2_aligned, analysis, adjustment_params, scoring_format):
@@ -1637,7 +1643,7 @@ def _generate_annotated_output(seq1_aligned, seq2_aligned, analysis, adjustment_
 
 
 def _generate_adjusted_score_string(adj_seq1, adj_seq2, analysis, adjustment_params, scoring_format,
-                                     demoted_spans=None):
+                                     vr_spans=None):
     """
     Generate intuitive score string for gap-adjusted alignment.
 
@@ -1647,6 +1653,7 @@ def _generate_adjusted_score_string(adj_seq1, adj_seq2, analysis, adjustment_par
     - Extension positions show extension marker (=)
     - Core positions show match (|) or mismatch ( )
     - Match positions show match (|) or ambiguous match (=)
+    - Core indel positions (counted as edits) show indel markers
     - Positions inside a short-HP demoted variant range use short_hp_edit
 
     Args:
@@ -1654,8 +1661,9 @@ def _generate_adjusted_score_string(adj_seq1, adj_seq2, analysis, adjustment_par
         analysis: AlignmentAnalysis from _analyze_alignment
         adjustment_params: AdjustmentParams for scoring behavior
         scoring_format: ScoringFormat for visualization
-        demoted_spans: List of (adj_start, adj_end) inclusive tuples flagging
-                       variant ranges demoted by the short-HP threshold.
+        vr_spans: List of (adj_start, adj_end, vr_info) inclusive tuples from
+                  _adjust_alignment_gaps mapping variant ranges to adjusted
+                  alignment positions.
 
     Returns:
         str: Scoring visualization string for adjusted alignment
@@ -1663,17 +1671,47 @@ def _generate_adjusted_score_string(adj_seq1, adj_seq2, analysis, adjustment_par
     adj_length = len(adj_seq1)
     score_chars = []
 
-    demoted_set = set()
-    if demoted_spans:
-        for s, e in demoted_spans:
-            for p in range(s, e + 1):
-                demoted_set.add(p)
+    # Precompute the marker for every single-gap column inside a variant range,
+    # based on how that column was scored:
+    # - short-HP demoted range: short_hp_edit for all gap columns
+    # - extension block (left/right of core): extension marker (not counted)
+    # - core block: counted indel -> indel_start for the first gap column,
+    #   indel_extension for the rest when normalize_indels (matching the
+    #   annotated visualization)
+    gap_markers = {}
+    if vr_spans:
+        for adj_start, adj_end, vr_info in vr_spans:
+            analysis1, analysis2 = vr_info.analysis1, vr_info.analysis2
+            # Mirror the layout logic of _adjust_variant_range
+            if adjustment_params.normalize_homopolymers:
+                left_ext_len = max(analysis1.left_extension_count,
+                                   analysis2.left_extension_count)
+                core_len = max(len(analysis1.core_content), len(analysis2.core_content))
+            else:
+                left_ext_len = 0
+                core_len = max(len(vr_info.allele1), len(vr_info.allele2))
 
-    # Adjusted alignment may have different length than original
-    # We need to track position mapping through the adjustment
+            short_hp_demoted = bool(vr_info.score_result.get('short_hp_edit'))
+            seen_core_indel = False
+            for offset in range(adj_end - adj_start + 1):
+                pos = adj_start + offset
+                gap1 = adj_seq1[pos] == '-'
+                gap2 = adj_seq2[pos] == '-'
+                if gap1 == gap2:
+                    continue  # both content or dual-gap: handled by main loop
+                if short_hp_demoted:
+                    gap_markers[pos] = scoring_format.short_hp_edit
+                elif left_ext_len <= offset < left_ext_len + core_len:
+                    # Core indel - counted as an edit
+                    if adjustment_params.normalize_indels and seen_core_indel:
+                        gap_markers[pos] = scoring_format.indel_extension
+                    else:
+                        gap_markers[pos] = scoring_format.indel_start
+                        seen_core_indel = True
+                else:
+                    # Extension block - normalized away, not counted
+                    gap_markers[pos] = scoring_format.homopolymer_extension
 
-    # For the adjusted alignment, we iterate through positions and generate
-    # appropriate markers based on content
     for pos in range(adj_length):
         char1 = adj_seq1[pos]
         char2 = adj_seq2[pos]
@@ -1697,14 +1735,16 @@ def _generate_adjusted_score_string(adj_seq1, adj_seq2, analysis, adjustment_par
                 score_chars.append(scoring_format.substitution)
             continue
 
-        # One has content, one has gap - this is an extension or core indel position
-        # In the adjusted alignment, gaps adjacent to matching context are extensions
-        if pos in demoted_set:
-            score_chars.append(scoring_format.short_hp_edit)
-        elif adjustment_params.normalize_homopolymers:
-            score_chars.append(scoring_format.homopolymer_extension)
-        else:
-            score_chars.append(scoring_format.indel_extension)
+        # One has content, one has gap - render according to how it was scored.
+        # Gap columns outside any variant range (unaligned flanks / end-trimmed
+        # regions) keep the extension-style rendering: in the adjusted alignment
+        # they read as repeat continuations of adjacent context.
+        marker = gap_markers.get(pos)
+        if marker is None:
+            marker = (scoring_format.homopolymer_extension
+                      if adjustment_params.normalize_homopolymers
+                      else scoring_format.indel_extension)
+        score_chars.append(marker)
 
     return ''.join(score_chars)
 
@@ -1726,14 +1766,14 @@ def _generate_adjusted_output(seq1_aligned, seq2_aligned, analysis, adjustment_p
         AlignmentResult: Result with adjusted alignment strings and intuitive score string
     """
     # Adjust the alignment gaps using the analysis
-    adj_seq1, adj_seq2, demoted_spans = _adjust_alignment_gaps(
+    adj_seq1, adj_seq2, vr_spans = _adjust_alignment_gaps(
         seq1_aligned, seq2_aligned, analysis, adjustment_params
     )
 
     # Generate score string for the adjusted alignment
     score_aligned = _generate_adjusted_score_string(
         adj_seq1, adj_seq2, analysis, adjustment_params, scoring_format,
-        demoted_spans=demoted_spans
+        vr_spans=vr_spans
     )
 
     return AlignmentResult(
@@ -1843,11 +1883,12 @@ def align_edlib_bidirectional(seq1, seq2):
 
     Process:
     1. Reverse complement both sequences
-    2. Global alignment with task=locations, parse CIGAR for suffix gaps
-    3. Trim sequences based on gap info
+    2. Semi-global (HW) alignment with task=path, parse CIGAR for suffix gaps
+    3. Trim sequences based on gap info (RC suffix = forward prefix)
     4. Reverse complement back to forward orientation
-    5. Global alignment with task=path for final result
-    6. Parse CIGAR for suffix gaps and trim final alignment
+    5. Semi-global (HW) alignment with task=path for final result
+    6. Re-attach trimmed prefix and any seq2 flanks left uncovered by the
+       HW alignment, padding the other sequence with gaps
 
     Args:
         seq1, seq2: Original DNA sequences
@@ -1865,9 +1906,7 @@ def align_edlib_bidirectional(seq1, seq2):
 
     # Track trimming information with local variables
     seq1_prefix_trimmed = 0
-    seq1_suffix_trimmed = 0
     seq2_prefix_trimmed = 0
-    seq2_suffix_trimmed = 0
 
     # Step 1: Reverse complement both sequences
     rc_seq1 = _reverse_complement(current_seq1)
@@ -1898,6 +1937,12 @@ def align_edlib_bidirectional(seq1, seq2):
                 rc_seq1 = rc_seq1[:-gap_length] if gap_length > 0 else rc_seq1
                 seq1_prefix_trimmed = gap_length  # suffix in RC = prefix in forward
 
+            # If trimming consumed an entire sequence, the sequences share no
+            # alignable region (e.g. completely dissimilar inputs where the
+            # whole query is a terminal insertion) - treat as alignment failure
+            if not rc_seq1 or not rc_seq2:
+                return None
+
     # Step 5: Reverse complement back to forward orientation
     current_seq1 = _reverse_complement(rc_seq1)
     current_seq2 = _reverse_complement(rc_seq2)
@@ -1908,13 +1953,27 @@ def align_edlib_bidirectional(seq1, seq2):
     if result['editDistance'] == -1:
         return None  # Sentinel value for failed alignment
 
-    # Step 8: Get nice alignment 
+    # Step 8: Get nice alignment
     alignment = edlib.getNiceAlignment(result, current_seq1, current_seq2)
     seq1_aligned = alignment['query_aligned']
     seq2_aligned = alignment['target_aligned']
 
-    # Step 9: Re-attach removed prefix and suffix regions with gap padding
-    # Only one sequence can have prefix trimmed, only one can have suffix trimmed
+    # Step 9: Re-attach seq2 (target) flanks left uncovered by the HW alignment.
+    # HW mode aligns the query to a substring of the target; target regions
+    # outside result['locations'] are omitted from the nice alignment entirely,
+    # so without this they would vanish from seq2_aligned and inflate
+    # seq2_coverage.
+    loc_start, loc_end = result['locations'][0]
+    if loc_start > 0:
+        seq1_aligned = '-' * loc_start + seq1_aligned
+        seq2_aligned = current_seq2[:loc_start] + seq2_aligned
+    uncovered_tail = len(current_seq2) - 1 - loc_end
+    if uncovered_tail > 0:
+        seq1_aligned = seq1_aligned + '-' * uncovered_tail
+        seq2_aligned = seq2_aligned + current_seq2[loc_end + 1:]
+
+    # Step 10: Re-attach the prefix removed during RC-stage trimming
+    # Only one sequence can have its prefix trimmed
 
     # Handle prefix: one sequence has actual prefix, other gets gap padding
     if seq1_prefix_trimmed > 0:

@@ -1,5 +1,18 @@
 # Changelog
 
+## Version 0.2.8
+- **Bug Fix**: Sequence regions beyond the overlap are no longer dropped from the alignment (LOCAL mode)
+  - edlib's semi-global (HW) alignment omits target flanks outside the aligned location range; `align_edlib_bidirectional()` silently lost these regions, so `seq2_aligned` was truncated and `seq2_coverage` read 1.0 regardless of how much of seq2 was unaligned
+  - Uncovered seq2 flanks are now re-attached with gap padding in seq1, making coverage symmetric under argument swap and consistent with `seq1_coverage`. Identity is unaffected (flanks lie outside the LOCAL scoring region); GLOBAL mode (NW alignment) was never affected
+  - Note: workflows that filtered on `min(seq1_coverage, seq2_coverage)` will now correctly reject pairs where seq2 has large unaligned flanks
+- **Bug Fix**: Completely dissimilar sequences no longer crash `align_and_score()`
+  - When the RC-stage CIGAR reported the entire query as a terminal insertion, trimming emptied one sequence and the forward alignment raised an exception inside `edlib.getNiceAlignment`
+  - Such pairs now return the existing alignment-failure sentinel (`identity=0.0`, `mismatches=-1`)
+- **Bug Fix**: `adjust_gaps=True` no longer renders counted core indels with the extension marker
+  - Every single-gap column was rendered as `=` (homopolymer extension, "normalized away") even when the variant range's core content was counted as an edit, contradicting the returned metrics
+  - Core indel columns now show the same indel markers as annotated output (`indel_start` / `indel_extension`); extension and short-HP-demoted rendering is unchanged
+- **Docs**: Corrected `end_skip_distance` docstrings to describe actual boundary semantics: scoring starts/ends at the position where both sequences reach their end_skip_distance-th nucleotide, i.e. the first/last `end_skip_distance - 1` nucleotides are excluded (behavior unchanged)
+
 ## Version 0.2.7
 - **New Feature**: Added `hp_normalize_min_length` to `AdjustmentParams` (default `1`) — minimum homopolymer run length at which HP normalization applies
   - When the shorter side's HP run length (`min(L1, L2)`) is below the threshold, the length difference is counted as an edit instead of being normalized away
