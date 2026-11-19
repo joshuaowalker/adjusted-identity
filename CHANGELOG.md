@@ -12,6 +12,8 @@
   - Homopolymer run lengths for `hp_normalize_min_length` are measured with string methods rather than a walk over the columns
   - `align_and_score()` builds the aligned strings itself from edlib's CIGAR instead of calling `edlib.getNiceAlignment`, and reads only the tail of the reverse-complement CIGAR
 - **Still pure Python**: no compiled extension and no new dependency (standard library plus edlib, Python 3.8+), so installation is unchanged
+- **Bug Fix**: the wheel no longer installs a top-level `tests` package next to `adjusted_identity`
+  - `setup.py` used a bare `find_packages()`, which picked up the repository's `tests/` directory, so every install put a package named `tests` into site-packages where it could shadow or collide with another project's. The tests still ship in the source distribution
 - **Internal**: output generation was rewritten around the column classes. The private helpers `_find_variant_ranges`, `_score_variant_range`, `_generate_variant_score_string`, `_adjust_variant_range`, `_adjust_alignment_gaps`, `_generate_annotated_output`, `_generate_adjusted_score_string`, `_extract_left_context` and `_extract_right_context` are gone or replaced. `_analyze_alignment` keeps its signature and output
 - **Tests**: `tests/test_fast_paths.py` holds each fast path to a plain counterpart (column-by-column classifier, uncached functions, character walk, edlib) and pins 0.2.10 output for unusual characters and scoring-region edge cases
 
