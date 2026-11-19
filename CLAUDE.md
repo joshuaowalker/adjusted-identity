@@ -15,6 +15,7 @@ adjusted-identity/
 ├── tests/                     # Test suite
 │   ├── __init__.py
 │   ├── test_score_alignment.py  # Core scoring tests
+│   ├── test_fast_paths.py      # Fast paths vs plain counterparts
 │   ├── test_alignment.py       # Alignment algorithm tests
 │   └── test_utilities.py       # Utility function tests
 ├── setup.py                   # Setup configuration
@@ -96,6 +97,19 @@ twine upload dist/*
    - Indel normalization - counts contiguous indels as single events
    - LOCAL/GLOBAL scoring modes - controls whether terminal gaps affect identity
 
+### How scoring works internally
+
+Scoring is pure Python built on C-level bytes/str methods, with no per-column Python loop on normal input:
+
+1. `_classify_columns()` labels every column with one class byte: `M` same standard nucleotide, `N` same non-standard symbol, `Q` different but equivalent symbols, `X` mismatch, `I`/`J` gap in seq1/seq2 only, `D` gap in both. The table-driven path handles plain `str` input in the IUPAC alphabet; anything else goes to `_classify_columns_generic()`, a column-by-column equivalent. `_are_nucleotides_equivalent()` remains the single definition of equivalence (the tables are built from it).
+2. `_compute_alignment_metrics()` (the single source of truth for metrics) reads the overlap, scoring region, variant ranges, repeat context and match count from the classes. Variant ranges are maximal runs of non-match columns; dual-gap columns never affect metrics and are skipped unless `include_dual_gap_ranges=True` (used by `_analyze_alignment`, which reports them).
+3. Each variant range is scored by `_score_variant()` (cached) from its two alleles and the repeat context; the short-HP threshold is applied on top because it depends on the surrounding sequence.
+4. Output is assembled as format-independent "score codes" (`_generate_annotated_score_string`, `_generate_adjusted_output`) and turned into `ScoringFormat` markers in one translate (`_codes_to_markers`).
+
+Caches (`_score_variant`, `_variant_codes`, `_adjusted_variant`, `_motif_matches_cached`, `_allele_analysis`) are bounded LRUs keyed on plain values. Results must never depend on cache state; `tests/test_fast_paths.py` enforces this.
+
+**Output must stay identical when optimizing.** Check with the local `perf_regression/check.py` harness and a differential run against the previous release's module (`git show <tag>:adjusted_identity/__init__.py`), not only the test suite.
+
 ### Key Constants
 
 - `DEFAULT_ADJUSTMENT_PARAMS` - All adjustments enabled (typical use case)
@@ -129,7 +143,13 @@ The test suite is comprehensive and serves as documentation:
    - Field-for-field equality with `score_alignment()` (both `adjust_gaps` modes) over a seeded synthetic corpus × every AdjustmentParams combination, plus the local MSA when present
    - Asserts the metrics path never calls visualization or variant-range-detail code
 
-4. **test_utilities.py**: Utility function tests
+4. **test_fast_paths.py**: holds every fast path to a plain counterpart
+   - Table-driven column classifier vs the column-by-column one, exhaustively over symbol pairs and through the whole pipeline
+   - Cached vs uncached scoring; thread safety; dual-gap columns never change metrics
+   - `_hp_run_length` string-method path vs the walk; `_expand_alignment` vs `edlib.getNiceAlignment`; CIGAR tail parsing vs full tokenizing
+   - Output pinned from 0.2.10 for unusual characters and scoring-region edge cases (each case was chosen because it exposes a specific plausible mistake)
+
+5. **test_utilities.py**: Utility function tests
    - Data class validation and immutability (including ScoringMode)
    - IUPAC nucleotide equivalence
    - CIGAR string parsing

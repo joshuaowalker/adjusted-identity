@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+- **Performance**: scoring is several times faster, with identical output. Measured on real data against 0.2.10 (per pair, single thread):
+  - `score_alignment_metrics()` on MSA rows with dual-gap columns already removed (how gaphack calls it): 6x faster (64 -> 11 us); 4.4x with `hp_normalize_min_length=6` (71 -> 16 us)
+  - `score_alignment_metrics()` on MSA rows as they are (dual-gap columns included): 28x faster (360 -> 13 us). `score_alignment()` on the same rows: 39x (670 -> 17 us)
+  - `align_and_score()` on reference barcode pairs: 2.5x faster (1.5 -> 0.6 ms); `score_alignment()` on the same pairs already aligned: 3.6x
+  - Output is unchanged: byte-for-byte identical on the 6,580 pinned alignments (7 parameter configurations, both `adjust_gaps` modes), on all 125,250 row pairs of a 501-row ONT MSA, and on over a million randomized comparisons against 0.2.10 covering every result field, `_analyze_alignment`, unusual characters and error messages
+- **How**: every alignment column is classified once (match, mismatch, gap in either sequence, gap in both) using C-level bytes operations, and the scoring region, variant ranges, repeat context, match counts and score strings are all read from those classes instead of looping over columns in Python
+  - Runs of dual-gap columns are skipped without being visited. They never affected the metrics, but each one used to be processed as a variant range, which is where most of the time went on MSA rows
+  - The handling of short variant ranges (a substitution, a one-base indel) is cached in small bounded LRU caches, a few megabytes when full. Results do not depend on cache state
+  - Homopolymer run lengths for `hp_normalize_min_length` are measured with string methods rather than a walk over the columns
+  - `align_and_score()` builds the aligned strings itself from edlib's CIGAR instead of calling `edlib.getNiceAlignment`, and reads only the tail of the reverse-complement CIGAR
+- **Still pure Python**: no compiled extension and no new dependency (standard library plus edlib, Python 3.8+), so installation is unchanged
+- **Internal**: output generation was rewritten around the column classes. The private helpers `_find_variant_ranges`, `_score_variant_range`, `_generate_variant_score_string`, `_adjust_variant_range`, `_adjust_alignment_gaps`, `_generate_annotated_output`, `_generate_adjusted_score_string`, `_extract_left_context` and `_extract_right_context` are gone or replaced. `_analyze_alignment` keeps its signature and output
+- **Tests**: `tests/test_fast_paths.py` holds each fast path to a plain counterpart (column-by-column classifier, uncached functions, character walk, edlib) and pins 0.2.10 output for unusual characters and scoring-region edge cases
+
 ## Version 0.2.10
 - **New Function**: `score_alignment_metrics(seq1_aligned, seq2_aligned, adjustment_params=None)` returns an `AlignmentMetrics` (identity, mismatches, scored_positions, seq1_coverage, seq2_coverage) for a pre-aligned pair without building the alignment and visualization strings
   - A supported public API for callers that only read the metrics (e.g. scoring every pair of MSA rows); use it instead of the private `_analyze_alignment`

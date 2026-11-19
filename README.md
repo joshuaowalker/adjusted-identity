@@ -283,6 +283,8 @@ print(f"MSA identity: {result.identity:.3f}")  # Both G's recognized as homopoly
 
 To score many MSA row pairs when you only need the numbers, use `score_alignment_metrics()`: it returns the same metrics without building the visualization strings (see the API reference).
 
+Rows can be passed straight from the MSA: columns where both rows have a gap never change the metrics and cost almost nothing to skip, so there is no need to remove them first.
+
 ### Custom Adjustments
 
 ```python

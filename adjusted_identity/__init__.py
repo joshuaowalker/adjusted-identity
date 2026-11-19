@@ -39,6 +39,7 @@ import edlib
 import re
 from dataclasses import dataclass
 from enum import Enum
+from functools import lru_cache
 
 
 class ScoringMode(str, Enum):
@@ -240,7 +241,8 @@ class VariantRangeInfo:
         allele2_positions: Source positions for allele2 characters
         analysis1: AlleleAnalysis for allele1
         analysis2: AlleleAnalysis for allele2
-        score_result: Scoring result dict from _score_variant_range
+        score_result: Scoring result dict with keys 'edits', 'scored_positions',
+            'both_pure_extension' and 'short_hp_edit'
     """
     start: int
     end: int
@@ -391,11 +393,13 @@ def _compute_nucleotides_equivalent(nuc1, nuc2, enable_iupac_intersection):
         return (is_match, is_match)
 
 
+_CIGAR_OP_REVERSED = re.compile(r'([=XIDM])(\d+)')
+
 
 def _parse_suffix_gap_from_cigar(cigar_string):
     """
     Parse CIGAR string from the end to find suffix gaps.
-    
+
     Args:
         cigar_string: CIGAR string from edlib (e.g., "6=3D")
 
@@ -405,18 +409,17 @@ def _parse_suffix_gap_from_cigar(cigar_string):
     """
     if not cigar_string:
         return None
-    
-    # Parse CIGAR operations (length, operation_type)
-    cigar_ops = re.findall(r'(\d+)([=XIDM])', cigar_string)
-    if not cigar_ops:
-        return None
-    
-    # Scan from end looking for contiguous gaps
+
+    # Only the trailing operations matter, so read the CIGAR backwards and stop
+    # at the first match/mismatch operation instead of tokenizing all of it.
+    # In the reversed string each operation reads as its type followed by its
+    # (reversed) length.
     gap_length = 0
     gap_type = None  # 'D' for deletions (gaps in query), 'I' for insertions (gaps in target)
-    
-    for length_str, op in reversed(cigar_ops):
-        if op in ('D', 'I'):
+
+    for cigar_op in _CIGAR_OP_REVERSED.finditer(cigar_string[::-1]):
+        op = cigar_op.group(1)
+        if op == 'D' or op == 'I':
             # First gap operation sets the type
             if gap_type is None:
                 gap_type = op
@@ -425,16 +428,184 @@ def _parse_suffix_gap_from_cigar(cigar_string):
                 # Reset since we found mixed types - not a clean suffix gap
                 gap_length = 0
                 break
-            gap_length += int(length_str)
+            gap_length += int(cigar_op.group(2)[::-1])
         else:
             # Match/mismatch operations end the gap region
             break
-    
+
     if gap_length > 0:
         gap_in_query = (gap_type == 'D')  # D = deletion = gap in query
         return (gap_length, gap_in_query)
-    
+
     return None
+
+
+# =============================================================================
+# Column classification
+# =============================================================================
+#
+# Scoring starts by labelling every alignment column with one class byte. The
+# scoring region, the variant ranges, repeat context, match counting and the
+# score string are then all read from those labels with C-level bytes methods
+# (find, count, translate, slicing) instead of a Python loop over the columns.
+#
+#   M  both sequences have the same standard nucleotide (exact match)
+#   N  both have the same non-standard symbol, e.g. R/R (a match, drawn as ambiguous)
+#   Q  different symbols that are equivalent, e.g. R/A (a match, drawn as ambiguous)
+#   X  both have content and it is not equivalent
+#   I  gap in seq1 only
+#   J  gap in seq2 only
+#   D  gap in both (dual gap)
+#
+# M, N and Q are "match" columns; X, I, J and D are "variant" columns. Repeat
+# context may only be read from M and N columns (where the two sequences hold
+# the same symbol).
+
+_CLS_MATCH, _CLS_SAME_AMBIGUOUS, _CLS_EQUIVALENT, _CLS_MISMATCH, _CLS_GAP1, _CLS_GAP2, _CLS_DUAL_GAP = b'MNQXIJD'
+_GAP_CLASSES = b'IJD'
+
+# The symbols the table-driven classifier understands (upper or lower case),
+# besides the gap character. Each gets a number 1-15; a gap is 0.
+_FAST_SYMBOLS = 'ACGTRYSWKMBDHVN'
+_UNENCODABLE = 0xFF
+
+_CLASS_TABLES = None
+
+
+def _build_class_tables():
+    """
+    Build the lookup tables behind _classify_columns (once, on first use).
+
+    Returns (and stores in _CLASS_TABLES) a tuple of four 256-byte tables:
+        [0] symbol-pair byte -> class byte, handle_iupac_overlap=False
+        [1] symbol-pair byte -> class byte, handle_iupac_overlap=True
+        [2] seq1 character -> symbol number in the high nibble
+        [3] seq2 character -> symbol number in the low nibble
+    Characters outside the supported alphabet encode as _UNENCODABLE.
+
+    The class tables are filled in by asking _are_nucleotides_equivalent about
+    every symbol pair, so that function stays the single definition of
+    equivalence.
+    """
+    global _CLASS_TABLES
+
+    encode_high = bytearray([_UNENCODABLE]) * 256
+    encode_low = bytearray([_UNENCODABLE]) * 256
+    encode_high[ord('-')] = encode_low[ord('-')] = 0
+    for number, symbol in enumerate(_FAST_SYMBOLS, 1):
+        for char in (symbol, symbol.lower()):
+            encode_high[ord(char)] = number << 4
+            encode_low[ord(char)] = number
+
+    class_tables = []
+    for handle_iupac in (False, True):
+        table = bytearray(256)
+        for pair in range(256):
+            number1, number2 = pair >> 4, pair & 15
+            if number1 == 0 and number2 == 0:
+                column_class = _CLS_DUAL_GAP
+            elif number1 == 0:
+                column_class = _CLS_GAP1
+            elif number2 == 0:
+                column_class = _CLS_GAP2
+            else:
+                is_match, is_ambiguous = _are_nucleotides_equivalent(
+                    _FAST_SYMBOLS[number1 - 1], _FAST_SYMBOLS[number2 - 1], handle_iupac)
+                if not is_match:
+                    column_class = _CLS_MISMATCH
+                elif not is_ambiguous:
+                    column_class = _CLS_MATCH
+                elif number1 == number2:
+                    column_class = _CLS_SAME_AMBIGUOUS
+                else:
+                    column_class = _CLS_EQUIVALENT
+            table[pair] = column_class
+        class_tables.append(bytes(table))
+
+    _CLASS_TABLES = (class_tables[0], class_tables[1], bytes(encode_high), bytes(encode_low))
+    return _CLASS_TABLES
+
+
+def _classify_columns(seq1_aligned, seq2_aligned, handle_iupac):
+    """
+    Label every alignment column with a class byte (see the table above).
+
+    Args:
+        seq1_aligned, seq2_aligned: Aligned sequences with gaps (same length)
+        handle_iupac: Whether different ambiguity codes may match via intersection
+
+    Returns:
+        bytes: One class byte per column
+    """
+    if (type(seq1_aligned) is str and type(seq2_aligned) is str
+            and seq1_aligned.isascii() and seq2_aligned.isascii()):
+        tables = _CLASS_TABLES or _build_class_tables()
+        encoded1 = seq1_aligned.encode('ascii').translate(tables[2])
+        encoded2 = seq2_aligned.encode('ascii').translate(tables[3])
+        if _UNENCODABLE not in encoded1 and _UNENCODABLE not in encoded2:
+            # seq1's symbol numbers sit in the high nibbles and seq2's in the
+            # low nibbles, so OR-ing the two as big integers gives one byte per
+            # column that identifies the symbol pair. A table lookup turns that
+            # into the column class.
+            paired = int.from_bytes(encoded1, 'big') | int.from_bytes(encoded2, 'big')
+            return paired.to_bytes(len(encoded1), 'big').translate(
+                tables[1 if handle_iupac else 0])
+
+    return _classify_columns_generic(seq1_aligned, seq2_aligned, handle_iupac)
+
+
+def _classify_columns_generic(seq1_aligned, seq2_aligned, handle_iupac):
+    """
+    Column-by-column equivalent of _classify_columns.
+
+    Handles input the table-driven path cannot encode: characters outside the
+    IUPAC alphabet, non-ASCII text and str subclasses.
+    """
+    classes = bytearray()
+    append = classes.append
+
+    for char1, char2 in zip(seq1_aligned, seq2_aligned):
+        if char1 == '-':
+            append(_CLS_DUAL_GAP if char2 == '-' else _CLS_GAP1)
+        elif char2 == '-':
+            append(_CLS_GAP2)
+        elif char1 == char2 and char1 in _STANDARD_NUCS:
+            append(_CLS_MATCH)
+        else:
+            is_match, is_ambiguous = _are_nucleotides_equivalent(char1, char2, handle_iupac)
+            if not is_match:
+                append(_CLS_MISMATCH)
+            elif not is_ambiguous:
+                append(_CLS_MATCH)
+            elif char1 == char2 or char1.upper() == char2.upper():
+                append(_CLS_SAME_AMBIGUOUS)
+            else:
+                append(_CLS_EQUIVALENT)
+
+    return bytes(classes)
+
+
+def _class_translation(mapping, default):
+    """Build a 256-byte translation table from {class byte: output byte}."""
+    table = bytearray([default]) * 256
+    for column_class, output in mapping.items():
+        table[column_class] = output
+    return bytes(table)
+
+
+_VARIANT = ord('V')
+
+# Two-letter views of the class string, used to walk variant ranges with
+# bytes.find: 'M' at match columns and 'V' at variant columns.
+_ANY_VARIANT_TABLE = _class_translation(
+    {_CLS_MISMATCH: _VARIANT, _CLS_GAP1: _VARIANT, _CLS_GAP2: _VARIANT, _CLS_DUAL_GAP: _VARIANT},
+    _CLS_MATCH)
+# Same, but dual-gap columns do not count as variant columns. Used to find
+# where a variant range with content starts, skipping dual-gap columns.
+_CONTENT_VARIANT_TABLE = _class_translation(
+    {_CLS_MISMATCH: _VARIANT, _CLS_GAP1: _VARIANT, _CLS_GAP2: _VARIANT},
+    _CLS_MATCH)
+
 
 def _find_scoring_region(seq1_aligned, seq2_aligned, adjustment_params):
     """
@@ -464,46 +635,48 @@ def _find_scoring_region(seq1_aligned, seq2_aligned, adjustment_params):
         tuple: (scoring_start, scoring_end) - inclusive range of alignment positions to score
     """
     alignment_length = len(seq1_aligned)
-    end_skip_distance = adjustment_params.end_skip_distance
     is_global = adjustment_params.scoring_mode == ScoringMode.GLOBAL
 
-    if end_skip_distance == 0:
-        if is_global:
-            # GLOBAL: score the entire alignment
-            return 0, alignment_length - 1
+    # GLOBAL: start from the full alignment bounds
+    scoring_start = 0
+    scoring_end = alignment_length - 1
 
-        # LOCAL: score only overlap region (both sequences have content)
-        scoring_start = 0
+    if not is_global:
+        # LOCAL: start from the overlap region (both sequences have content)
         for pos in range(alignment_length):
             if seq1_aligned[pos] != '-' and seq2_aligned[pos] != '-':
                 scoring_start = pos
                 break
 
-        scoring_end = alignment_length - 1
         for pos in range(alignment_length - 1, -1, -1):
             if seq1_aligned[pos] != '-' and seq2_aligned[pos] != '-':
                 scoring_end = pos
                 break
 
+    return _trim_scoring_region(seq1_aligned, seq2_aligned, scoring_start, scoring_end,
+                                adjustment_params.end_skip_distance)
+
+
+def _trim_scoring_region(seq1_aligned, seq2_aligned, scoring_start, scoring_end,
+                         end_skip_distance):
+    """
+    Apply end trimming to a scoring region.
+
+    From each end of [scoring_start, scoring_end], moves inward to the position
+    where both sequences have reached their end_skip_distance-th nucleotide.
+
+    Args:
+        seq1_aligned, seq2_aligned: Aligned sequences with gaps
+        scoring_start, scoring_end: Region before trimming (inclusive)
+        end_skip_distance: Nucleotides to skip from each end (0 = no trimming)
+
+    Returns:
+        tuple: (scoring_start, scoring_end) after trimming (inclusive)
+    """
+    if end_skip_distance == 0:
         return scoring_start, scoring_end
 
-    # end_skip_distance > 0: skip nucleotides from each end
-    if is_global:
-        # GLOBAL: start from full alignment bounds, then trim nucleotides
-        scoring_start = 0
-        scoring_end = alignment_length - 1
-    else:
-        # LOCAL: start from overlap bounds, then trim nucleotides
-        scoring_start = 0
-        for pos in range(alignment_length):
-            if seq1_aligned[pos] != '-' and seq2_aligned[pos] != '-':
-                scoring_start = pos
-                break
-        scoring_end = alignment_length - 1
-        for pos in range(alignment_length - 1, -1, -1):
-            if seq1_aligned[pos] != '-' and seq2_aligned[pos] != '-':
-                scoring_end = pos
-                break
+    alignment_length = len(seq1_aligned)
 
     # From the determined bounds, skip end_skip_distance nucleotides inward
     seq1_count = seq2_count = 0
@@ -531,20 +704,21 @@ def _find_scoring_region(seq1_aligned, seq2_aligned, adjustment_params):
     return trimmed_start, trimmed_end
 
 
-def _extract_left_context(seq1_aligned, seq2_aligned, position, length):
+def _left_context(classes, seq1_aligned, position, length):
     """
     Extract up to 'length' nucleotide characters from match positions before 'position'.
 
-    Context is only valid from positions where both sequences agree (match positions).
-    Since seq1 == seq2 at match positions, we read from seq1 and verify agreement.
+    Context is only valid from positions where both sequences hold the same
+    symbol (ignoring case), so it is read from seq1.
 
     Rules:
-    - Match (seq1 == seq2, non-gap) → use the character
+    - Same symbol in both (non-gap) → use the character
     - Dual-gap (both '-') → skip (not a match, but not a conflict)
-    - Any other case (gap or mismatch) → hit another variant range, return None
+    - Any other case (gap or different symbols) → hit another variant range, stop
 
     Args:
-        seq1_aligned, seq2_aligned: Aligned sequences with gaps
+        classes: Column classes of the alignment (from _classify_columns)
+        seq1_aligned: First aligned sequence with gaps
         position: Starting position (exclusive, work backward from here)
         length: Maximum number of nucleotide characters to extract
 
@@ -554,34 +728,23 @@ def _extract_left_context(seq1_aligned, seq2_aligned, position, length):
             variant range (non-match position) is reached first - or None if
             no context characters are available at all.
 
-    Examples:
-        >>> _extract_left_context("AGG-AC", "AG-GAC", 2, 1)
-        'G'  # Position 1 is a match
-        >>> _extract_left_context("AGT-AC", "AX-GAC", 2, 1)
-        None  # Position 1 is not a match (G vs X), no context available
+    Examples (for seq1/seq2 as shown):
+        "AGG-AC" / "AG-GAC", position 2, length 1 → 'G'  (position 1 is a match)
+        "AGT-AC" / "AX-GAC", position 2, length 1 → None  (position 1 is G vs X)
     """
     context_chars = []
     pos = position - 1
     collected = 0
 
     while collected < length and pos >= 0:
-        char1 = seq1_aligned[pos]
-        char2 = seq2_aligned[pos]
-
-        # Dual-gap: skip (not a match position, but doesn't end context search)
-        if char1 == '-' and char2 == '-':
-            pos -= 1
-            continue
-
-        # Check for match: must be non-gap and equal (case-insensitive)
-        if char1 != '-' and char2 != '-' and (char1 == char2 or char1.upper() == char2.upper()):
-            context_chars.append(char1)
+        column_class = classes[pos]
+        if column_class == _CLS_MATCH or column_class == _CLS_SAME_AMBIGUOUS:
+            context_chars.append(seq1_aligned[pos])
             collected += 1
-            pos -= 1
-            continue
-
-        # Any other case: we've hit a variant range (gap or mismatch)
-        break
+        elif column_class != _CLS_DUAL_GAP:
+            # We've hit a variant range (gap or mismatch)
+            break
+        pos -= 1
 
     if not context_chars:
         return None
@@ -589,20 +752,15 @@ def _extract_left_context(seq1_aligned, seq2_aligned, position, length):
     return ''.join(reversed(context_chars))
 
 
-def _extract_right_context(seq1_aligned, seq2_aligned, position, length):
+def _right_context(classes, seq1_aligned, position, length):
     """
     Extract up to 'length' nucleotide characters from match positions after 'position'.
 
-    Context is only valid from positions where both sequences agree (match positions).
-    Since seq1 == seq2 at match positions, we read from seq1 and verify agreement.
-
-    Rules:
-    - Match (seq1 == seq2, non-gap) → use the character
-    - Dual-gap (both '-') → skip (not a match, but not a conflict)
-    - Any other case (gap or mismatch) → hit another variant range, return None
+    The mirror image of _left_context: same rules, working forward.
 
     Args:
-        seq1_aligned, seq2_aligned: Aligned sequences with gaps
+        classes: Column classes of the alignment (from _classify_columns)
+        seq1_aligned: First aligned sequence with gaps
         position: Starting position (exclusive, work forward from here)
         length: Maximum number of nucleotide characters to extract
 
@@ -612,35 +770,24 @@ def _extract_right_context(seq1_aligned, seq2_aligned, position, length):
             variant range (non-match position) is reached first - or None if
             no context characters are available at all.
 
-    Examples:
-        >>> _extract_right_context("AGA--TT", "AGAT-TT", 4, 2)
-        'TT'  # Positions 5-6 are matches
-        >>> _extract_right_context("AGA--TC", "AGAT-TG", 4, 2)
-        'T'  # Position 5 matches; position 6 is not a match (C vs G)
+    Examples (for seq1/seq2 as shown):
+        "AGA--TT" / "AGAT-TT", position 4, length 2 → 'TT'  (positions 5-6 are matches)
+        "AGA--TC" / "AGAT-TG", position 4, length 2 → 'T'  (position 6 is C vs G)
     """
     context_chars = []
     pos = position + 1
-    max_pos = len(seq1_aligned)
+    max_pos = len(classes)
     collected = 0
 
     while collected < length and pos < max_pos:
-        char1 = seq1_aligned[pos]
-        char2 = seq2_aligned[pos]
-
-        # Dual-gap: skip (not a match position, but doesn't end context search)
-        if char1 == '-' and char2 == '-':
-            pos += 1
-            continue
-
-        # Check for match: must be non-gap and equal (case-insensitive)
-        if char1 != '-' and char2 != '-' and (char1 == char2 or char1.upper() == char2.upper()):
-            context_chars.append(char1)
+        column_class = classes[pos]
+        if column_class == _CLS_MATCH or column_class == _CLS_SAME_AMBIGUOUS:
+            context_chars.append(seq1_aligned[pos])
             collected += 1
-            pos += 1
-            continue
-
-        # Any other case: we've hit a variant range (gap or mismatch)
-        break
+        elif column_class != _CLS_DUAL_GAP:
+            # We've hit a variant range (gap or mismatch)
+            break
+        pos += 1
 
     if not context_chars:
         return None
@@ -673,6 +820,29 @@ def _extract_allele(seq_aligned, start, end):
     return (''.join(chars), positions)
 
 
+# Caching
+#
+# Variant ranges are overwhelmingly short (a substitution, a one-base indel)
+# and drawn from a tiny alphabet, so the same work recurs constantly and is
+# cached: comparing a chunk of an allele with a motif, scoring a pair of
+# alleles in their context, and (further down) generating the output for a
+# variant range. Each cache is a bounded LRU of this many entries, keyed on
+# plain strings, ints and bools; all of them full hold a few megabytes. Long
+# variant ranges rarely repeat, so they skip the caches rather than crowd out
+# the short ones.
+_CACHE_SIZE = 4096
+_VARIANT_CACHE_MAX_ALLELES = 8   # combined length of the two alleles
+_OUTPUT_CACHE_MAX_SPAN = 16      # columns in the variant range
+_SHARED_ANALYSIS_MAX_CORE = 8    # characters of core content
+
+# AlleleAnalysis is immutable and the same few results come up constantly, so
+# equal results share one instance instead of being constructed each time
+_allele_analysis = lru_cache(maxsize=_CACHE_SIZE)(AlleleAnalysis)
+_EMPTY_ALLELE_ANALYSIS = AlleleAnalysis(0, 0, '', True)
+_LEFT_EXTENSION_ANALYSIS = AlleleAnalysis(1, 0, '', True, 1, 0)    # one character extending the left context
+_RIGHT_EXTENSION_ANALYSIS = AlleleAnalysis(0, 1, '', True, 0, 1)   # one character extending the right context
+
+
 def _motif_matches(chunk, motif, handle_iupac):
     """
     Check if chunk matches motif using IUPAC equivalence.
@@ -698,6 +868,10 @@ def _motif_matches(chunk, motif, handle_iupac):
     return True
 
 
+# Motifs are a character or two long, so the same comparisons recur constantly
+_motif_matches_cached = lru_cache(maxsize=_CACHE_SIZE)(_motif_matches)
+
+
 def _analyze_allele(allele, left_context, right_context, max_motif_length, handle_iupac):
     """
     Analyze an allele to determine what portions are repeat extensions.
@@ -716,7 +890,7 @@ def _analyze_allele(allele, left_context, right_context, max_motif_length, handl
         AlleleAnalysis: Analysis result with extension counts and core content
     """
     if not allele:
-        return AlleleAnalysis(0, 0, '', True)  # Empty allele = pure extension
+        return _EMPTY_ALLELE_ANALYSIS  # Empty allele = pure extension
 
     n = len(allele)
 
@@ -730,16 +904,17 @@ def _analyze_allele(allele, left_context, right_context, max_motif_length, handl
         char = allele[0]
         if left_context and _are_nucleotides_equivalent(
                 char, left_context[-1], handle_iupac)[0]:
-            return AlleleAnalysis(1, 0, '', True, 1, 0)
+            return _LEFT_EXTENSION_ANALYSIS
         if right_context and _are_nucleotides_equivalent(
                 char, right_context[0], handle_iupac)[0]:
-            return AlleleAnalysis(0, 1, '', True, 0, 1)
-        return AlleleAnalysis(0, 0, allele, False, 0, 0)
+            return _RIGHT_EXTENSION_ANALYSIS
+        return _allele_analysis(0, 0, allele, False, 0, 0)
 
     left_consumed = 0
     right_consumed = 0
     left_motif_len_used = 0
     right_motif_len_used = 0
+    motif_matches = _motif_matches_cached if type(handle_iupac) is bool else _motif_matches
 
     # LEFT EXTENSION: Try different motif lengths (largest first)
     if left_context:
@@ -760,7 +935,7 @@ def _analyze_allele(allele, left_context, right_context, max_motif_length, handl
             pos = 0
             while pos + motif_len <= n:
                 chunk = allele[pos:pos + motif_len]
-                if _motif_matches(chunk, motif, handle_iupac):
+                if chunk == motif or motif_matches(chunk, motif, handle_iupac):
                     consumed += motif_len
                     pos += motif_len
                 else:
@@ -797,7 +972,7 @@ def _analyze_allele(allele, left_context, right_context, max_motif_length, handl
                 chunk_start = remaining_start + pos - motif_len
                 chunk_end = remaining_start + pos
                 chunk = allele[chunk_start:chunk_end]
-                if _motif_matches(chunk, motif, handle_iupac):
+                if chunk == motif or motif_matches(chunk, motif, handle_iupac):
                     consumed += motif_len
                     pos -= motif_len
                 else:
@@ -813,82 +988,26 @@ def _analyze_allele(allele, left_context, right_context, max_motif_length, handl
     core_end = n - right_consumed
     core_content = allele[core_start:core_end] if core_end > core_start else ''
 
-    return AlleleAnalysis(
-        left_extension_count=left_consumed,
-        right_extension_count=right_consumed,
-        core_content=core_content,
-        is_pure_extension=(len(core_content) == 0),
-        left_motif_length=left_motif_len_used,
-        right_motif_length=right_motif_len_used,
-    )
+    if len(core_content) > _SHARED_ANALYSIS_MAX_CORE:
+        return AlleleAnalysis(
+            left_extension_count=left_consumed,
+            right_extension_count=right_consumed,
+            core_content=core_content,
+            is_pure_extension=False,
+            left_motif_length=left_motif_len_used,
+            right_motif_length=right_motif_len_used,
+        )
+    return _allele_analysis(left_consumed, right_consumed, core_content,
+                            len(core_content) == 0,
+                            left_motif_len_used, right_motif_len_used)
 
 
-def _find_variant_ranges(seq1_aligned, seq2_aligned, scoring_start, scoring_end, handle_iupac):
-    """
-    Find all variant ranges within the scoring region.
-
-    A variant range is a maximal contiguous region where at least one position
-    is NOT a non-gap match or dual-gap. Bounded by match positions on left/right.
-
-    Args:
-        seq1_aligned, seq2_aligned: Aligned sequences with gaps
-        scoring_start, scoring_end: Scoring region boundaries (inclusive)
-        handle_iupac: Whether to use IUPAC intersection matching
-
-    Returns:
-        List of tuples: [(start, end, left_bound_pos, right_bound_pos), ...]
-        where start/end are inclusive positions of the variant range,
-        and bound positions point to the bounding match positions (-1 if none).
-    """
-    variant_ranges = []
-    i = scoring_start
-
-    # Inline match checking for performance - avoid function call overhead
-    while i <= scoring_end:
-        c1, c2 = seq1_aligned[i], seq2_aligned[i]
-        # Fast path: exact match of non-gap characters (most common case)
-        if c1 == c2 and c1 != '-':
-            i += 1
-            continue
-        # Check for gap - any gap means not a match
-        if c1 == '-' or c2 == '-':
-            pass  # Not a match, fall through to variant range handling
-        # Slow path: check IUPAC equivalence for different characters
-        elif _are_nucleotides_equivalent(c1, c2, handle_iupac)[0]:
-            i += 1
-            continue
-
-        # Found start of variant range
-        variant_start = i
-        # Left bound is the position just before variant start (if within scoring region)
-        left_bound_pos = i - 1 if i > scoring_start else -1
-
-        # Scan to find end of variant range (inline match check for performance)
-        i += 1
-        while i <= scoring_end:
-            c1, c2 = seq1_aligned[i], seq2_aligned[i]
-            # Fast path: exact match of non-gap characters
-            if c1 == c2 and c1 != '-':
-                break
-            # Gap means not a match - continue in variant range
-            if c1 == '-' or c2 == '-':
-                i += 1
-                continue
-            # Slow path: check IUPAC equivalence
-            if _are_nucleotides_equivalent(c1, c2, handle_iupac)[0]:
-                break
-            i += 1
-
-        variant_end = i - 1
-        # Right bound is the position just after variant end (if within scoring region)
-        right_bound_pos = i if i <= scoring_end else -1
-
-        variant_ranges.append((variant_start, variant_end, left_bound_pos, right_bound_pos))
-
-    return variant_ranges
+# How far to look on each side of a variant range for the end of a homopolymer
+# run before falling back to scanning the rest of the sequence
+_HP_RUN_WINDOW = 32
 
 
-def _hp_run_length(seq_aligned, vr_start, vr_end, base):
+def _hp_run_length(seq_aligned, vr_start, vr_end, base, run_chars=None):
     """
     Count the length of the homopolymer run of `base` in `seq_aligned` that
     spans and touches the variant range [vr_start, vr_end].
@@ -901,12 +1020,42 @@ def _hp_run_length(seq_aligned, vr_start, vr_end, base):
         seq_aligned: Aligned sequence with '-' for gaps
         vr_start, vr_end: Variant range boundaries (inclusive)
         base: The homopolymer base to measure (single character)
+        run_chars: Optional shortcut for a plain ASCII str sequence and a
+            non-gap base: the upper- and lower-case forms of `base`, which are
+            then the only characters that count as the base. Lets the run be
+            measured with str methods instead of a walk over the columns.
 
     Returns:
         Total number of `base` characters in the run, or 0 if `base` is empty.
     """
     if not base:
         return 0
+
+    if run_chars is not None:
+        # Occurrences within the variant range
+        inside = seq_aligned[vr_start:vr_end + 1]
+        count = inside.count(run_chars[0])
+        if run_chars[1] != run_chars[0]:
+            count += inside.count(run_chars[1])
+
+        # Run to the left: with gaps removed, the trailing base characters
+        before = seq_aligned[max(vr_start - _HP_RUN_WINDOW, 0):vr_start].replace('-', '')
+        run = len(before) - len(before.rstrip(run_chars))
+        if run == len(before) and vr_start > _HP_RUN_WINDOW:
+            # The run reaches the edge of the window: measure it in full
+            before = seq_aligned[:vr_start].replace('-', '')
+            run = len(before) - len(before.rstrip(run_chars))
+        count += run
+
+        # Run to the right: with gaps removed, the leading base characters
+        after_start = vr_end + 1
+        after = seq_aligned[after_start:after_start + _HP_RUN_WINDOW].replace('-', '')
+        run = len(after) - len(after.lstrip(run_chars))
+        if run == len(after) and after_start + _HP_RUN_WINDOW < len(seq_aligned):
+            after = seq_aligned[after_start:].replace('-', '')
+            run = len(after) - len(after.lstrip(run_chars))
+        return count + run
+
     base_upper = base.upper()
     n = len(seq_aligned)
     count = 0
@@ -946,13 +1095,16 @@ def _hp_run_length(seq_aligned, vr_start, vr_end, base):
 
 
 def _short_hp_demote(allele1, analysis1, allele2, analysis2, adjustment_params,
-                     seq1_aligned, seq2_aligned, vr_start, vr_end):
+                     seq1_aligned, seq2_aligned, vr_start, vr_end, ascii_sequences=False):
     """
     Decide whether a homopolymer extension should be demoted to a counted edit
     because the shorter side's HP run length is below hp_normalize_min_length.
 
     Returns True only when motif length 1 (true homopolymer) extensions are
     involved and min(L1, L2) < hp_normalize_min_length for any base used.
+
+    ascii_sequences: pass True when both sequences are plain ASCII str, to
+    measure the runs with str methods (see _hp_run_length).
     """
     threshold = adjustment_params.hp_normalize_min_length
     if threshold <= 1:
@@ -984,15 +1136,19 @@ def _short_hp_demote(allele1, analysis1, allele2, analysis2, adjustment_params,
         return False
 
     for base in bases_to_check:
-        L1 = _hp_run_length(seq1_aligned, vr_start, vr_end, base)
-        L2 = _hp_run_length(seq2_aligned, vr_start, vr_end, base)
-        if min(L1, L2) < threshold:
+        # In ASCII, the characters that upper-case to the base's upper-case
+        # form are exactly its two case forms
+        run_chars = base.upper() + base.lower() if ascii_sequences else None
+        # Demote when the shorter of the two runs is below the threshold
+        if _hp_run_length(seq1_aligned, vr_start, vr_end, base, run_chars) < threshold:
+            return True
+        if _hp_run_length(seq2_aligned, vr_start, vr_end, base, run_chars) < threshold:
             return True
     return False
 
 
-def _score_variant_range(allele1, analysis1, allele2, analysis2, adjustment_params,
-                         seq1_aligned, seq2_aligned, vr_start, vr_end):
+def _score_alleles(allele1, analysis1, allele2, analysis2,
+                   normalize_homopolymers, normalize_indels, handle_iupac):
     """
     Score a variant range given two allele analyses using Occam's razor.
 
@@ -1004,117 +1160,53 @@ def _score_variant_range(allele1, analysis1, allele2, analysis2, adjustment_para
     When normalize_homopolymers=False:
     - Extensions are treated as regular indels
 
-    When hp_normalize_min_length > 1 and the shorter HP run is below that
-    length, a pure-extension variant range is demoted back to a regular indel
-    edit (flagged with short_hp_edit=True) instead of being normalized.
+    The short-HP threshold (hp_normalize_min_length) is not applied here: it
+    depends on the sequence around the variant range, so the caller applies it
+    on top of this result (see _compute_alignment_metrics).
 
     Args:
         allele1, allele2: The allele strings
         analysis1, analysis2: AlleleAnalysis for each allele
-        adjustment_params: AdjustmentParams for scoring behavior
-        seq1_aligned, seq2_aligned: Full aligned sequences (for HP run-length walks)
-        vr_start, vr_end: Variant range boundaries (inclusive)
+        normalize_homopolymers: Whether repeat extensions are normalized away
+        normalize_indels: Whether contiguous indels count as a single edit
+        handle_iupac: Whether to use IUPAC intersection matching
 
     Returns:
-        dict: {
-            'edits': int,
-            'scored_positions': int,
-            'both_pure_extension': bool,
-            'short_hp_edit': bool
-        }
+        tuple: (edits, scored_positions, both_pure_extension)
     """
     # When homopolymer normalization is disabled, treat extensions as indels
-    if not adjustment_params.normalize_homopolymers:
+    if not normalize_homopolymers:
         # Total content from both alleles (treating as a regular indel region)
         total_len = max(len(allele1), len(allele2))
         if total_len == 0:
-            return {'edits': 0, 'scored_positions': 0, 'both_pure_extension': False, 'short_hp_edit': False}
-
-        if adjustment_params.normalize_indels:
-            return {
-                'edits': 1,
-                'scored_positions': 1,
-                'both_pure_extension': False,
-                'short_hp_edit': False,
-            }
-        else:
-            return {
-                'edits': total_len,
-                'scored_positions': total_len,
-                'both_pure_extension': False,
-                'short_hp_edit': False,
-            }
-
-    # Short-HP threshold check: if the shorter HP run is below the configured
-    # minimum, demote pure-extension variant ranges to a counted edit. Applies
-    # to pure-extension cases only (where the length diff would otherwise
-    # normalize to 0 edits).
-    pure_ext_case = (analysis1.is_pure_extension or analysis2.is_pure_extension)
-    if pure_ext_case and _short_hp_demote(allele1, analysis1, allele2, analysis2,
-                                          adjustment_params,
-                                          seq1_aligned, seq2_aligned, vr_start, vr_end):
-        total_len = max(len(allele1), len(allele2))
-        if total_len == 0:
-            return {'edits': 0, 'scored_positions': 0, 'both_pure_extension': False, 'short_hp_edit': True}
-        if adjustment_params.normalize_indels:
-            return {'edits': 1, 'scored_positions': 1, 'both_pure_extension': False, 'short_hp_edit': True}
-        return {'edits': total_len, 'scored_positions': total_len, 'both_pure_extension': False, 'short_hp_edit': True}
+            return (0, 0, False)
+        if normalize_indels:
+            return (1, 1, False)
+        return (total_len, total_len, False)
 
     # Both pure extensions -> homopolymer equivalent
     if analysis1.is_pure_extension and analysis2.is_pure_extension:
-        return {
-            'edits': 0,
-            'scored_positions': 0,
-            'both_pure_extension': True,
-            'short_hp_edit': False,
-        }
+        return (0, 0, True)
 
     # One pure extension, other has core -> count core as edits
     if analysis1.is_pure_extension:
         core = analysis2.core_content
-        if adjustment_params.normalize_indels:
-            return {
-                'edits': 1 if core else 0,
-                'scored_positions': 1 if core else 0,
-                'both_pure_extension': False,
-                'short_hp_edit': False,
-            }
-        else:
-            return {
-                'edits': len(core),
-                'scored_positions': len(core),
-                'both_pure_extension': False,
-                'short_hp_edit': False,
-            }
+        if normalize_indels:
+            return (1 if core else 0, 1 if core else 0, False)
+        return (len(core), len(core), False)
 
     if analysis2.is_pure_extension:
         core = analysis1.core_content
-        if adjustment_params.normalize_indels:
-            return {
-                'edits': 1 if core else 0,
-                'scored_positions': 1 if core else 0,
-                'both_pure_extension': False,
-                'short_hp_edit': False,
-            }
-        else:
-            return {
-                'edits': len(core),
-                'scored_positions': len(core),
-                'both_pure_extension': False,
-                'short_hp_edit': False,
-            }
+        if normalize_indels:
+            return (1 if core else 0, 1 if core else 0, False)
+        return (len(core), len(core), False)
 
     # Both have core -> compare cores
     core1, core2 = analysis1.core_content, analysis2.core_content
 
     if core1 == core2:
         # Cores are identical - just extension differences
-        return {
-            'edits': 0,
-            'scored_positions': len(core1),
-            'both_pure_extension': False,
-            'short_hp_edit': False,
-        }
+        return (0, len(core1), False)
 
     # Cores differ - compute edit count
     min_len = min(len(core1), len(core2))
@@ -1122,12 +1214,11 @@ def _score_variant_range(allele1, analysis1, allele2, analysis2, adjustment_para
 
     # Count substitutions in overlapping region
     substitutions = sum(1 for i in range(min_len)
-                        if not _are_nucleotides_equivalent(core1[i], core2[i],
-                                                          adjustment_params.handle_iupac_overlap)[0])
+                        if not _are_nucleotides_equivalent(core1[i], core2[i], handle_iupac)[0])
 
     # Handle length difference as indel
     if max_len > min_len:
-        if adjustment_params.normalize_indels:
+        if normalize_indels:
             indel_edits = 1
             indel_scored = 1
         else:
@@ -1137,158 +1228,218 @@ def _score_variant_range(allele1, analysis1, allele2, analysis2, adjustment_para
         indel_edits = 0
         indel_scored = 0
 
-    return {
-        'edits': substitutions + indel_edits,
-        'scored_positions': min_len + indel_scored,
-        'both_pure_extension': False,
-        'short_hp_edit': False,
-    }
+    return (substitutions + indel_edits, min_len + indel_scored, False)
 
 
-def _generate_variant_score_string(seq1_aligned, seq2_aligned, start, end,
-                                    analysis1, analysis2, allele1_positions, allele2_positions,
-                                    scoring_format, adjustment_params, score_result=None):
+class _VariantScore:
     """
-    Generate score_aligned string for a variant range.
+    How one variant range scores: the analysis of its two alleles and the
+    resulting edit count, before any short-HP demotion.
 
-    The visualization reflects how positions were scored:
-    - Extension positions show extension marker (=)
-    - Core positions show match (|) if cores match, mismatch ( ) if they differ
-    - Gap positions show extension marker if the other sequence is an extension
-    - When score_result['short_hp_edit'] is True, extension positions use the
-      short_hp_edit marker instead of homopolymer_extension
+    This depends only on the two alleles, the repeat context on each side and
+    the scoring parameters, and the same few combinations recur constantly, so
+    instances are cached (see _score_variant) and shared between alignments.
+    They are never modified after construction.
+
+    shape is what output generation needs to know about the two analyses:
+    (left1, right1, left2, right2, cores_match) - the extension counts of each
+    allele and whether the two cores are identical.
+    """
+    __slots__ = ('analysis1', 'analysis2', 'edits', 'scored_positions',
+                 'both_pure_extension', 'shape')
+
+
+def _new_variant_score(allele1, allele2, left_context, right_context,
+                       max_motif_length, handle_iupac,
+                       normalize_homopolymers, normalize_indels):
+    """
+    Analyze and score one variant range.
 
     Args:
-        seq1_aligned, seq2_aligned: Aligned sequences
-        start, end: Variant range boundaries (inclusive)
-        analysis1, analysis2: AlleleAnalysis for each allele
-        allele1_positions, allele2_positions: Source positions for each allele's chars
-        scoring_format: ScoringFormat for visualization
-        adjustment_params: AdjustmentParams for scoring behavior
-        score_result: Scoring dict from _score_variant_range (for short_hp_edit flag)
+        allele1, allele2: Non-gap content of each sequence in the variant range
+        left_context, right_context: Repeat context on each side (or None)
+        max_motif_length: Maximum repeat motif length to try
+        handle_iupac: Whether to use IUPAC intersection matching
+        normalize_homopolymers: Whether repeat extensions are normalized away
+        normalize_indels: Whether contiguous indels count as a single edit
 
     Returns:
-        str: Score visualization string for this variant range
+        _VariantScore
     """
+    analysis1 = _analyze_allele(allele1, left_context, right_context,
+                                max_motif_length, handle_iupac)
+    analysis2 = _analyze_allele(allele2, left_context, right_context,
+                                max_motif_length, handle_iupac)
+
+    variant = _VariantScore()
+    variant.analysis1 = analysis1
+    variant.analysis2 = analysis2
+    (variant.edits, variant.scored_positions,
+     variant.both_pure_extension) = _score_alleles(
+        allele1, analysis1, allele2, analysis2,
+        normalize_homopolymers, normalize_indels, handle_iupac)
+    variant.shape = (analysis1.left_extension_count, analysis1.right_extension_count,
+                     analysis2.left_extension_count, analysis2.right_extension_count,
+                     analysis1.core_content == analysis2.core_content)
+    return variant
+
+
+# Only call the cached form with plain str/None, int and bool arguments
+_score_variant = lru_cache(maxsize=_CACHE_SIZE)(_new_variant_score)
+
+
+# Score codes: an intermediate, format-independent form of the score string.
+# Match columns keep their class byte (M, N, Q) and dual gaps keep D; the other
+# codes are below. _codes_to_markers turns codes into ScoringFormat markers.
+_CODE_MATCH = _CLS_MATCH
+_CODE_AMBIGUOUS = _CLS_SAME_AMBIGUOUS
+_CODE_DUAL_GAP = _CLS_DUAL_GAP
+(_CODE_END_TRIMMED, _CODE_SUBSTITUTION, _CODE_HP_EXTENSION, _CODE_SHORT_HP_EDIT,
+ _CODE_INDEL_START, _CODE_INDEL_EXTENSION) = b'TSHPOE'
+
+
+def _build_variant_codes(pattern, shape, short_hp_demoted,
+                         normalize_homopolymers, normalize_indels):
+    """
+    Generate score codes for the columns of a variant range.
+
+    The visualization reflects how positions were scored:
+    - Extension positions show the extension code
+    - Core positions show match if cores match, substitution if they differ
+    - Gap positions show the extension code if the other sequence is an extension
+    - When the short-HP threshold demoted this variant range to a counted edit,
+      extension positions use the short-HP-edit code instead
+
+    Args:
+        pattern: Class bytes of the variant range's columns (X, I, J or D each)
+        shape: (left1, right1, left2, right2, cores_match) from the allele
+            analyses - extension counts for each allele and whether the cores
+            are identical
+        short_hp_demoted: Whether the short-HP threshold demoted this range
+        normalize_homopolymers: Whether repeat extensions are normalized away
+        normalize_indels: Whether contiguous indels count as a single edit
+
+    Returns:
+        bytes: One score code per column
+    """
+    left1, right1, left2, right2, cores_match = shape
+
+    # Columns holding each allele's characters, in order
+    allele1_positions = [pos for pos, column_class in enumerate(pattern)
+                         if column_class == _CLS_MISMATCH or column_class == _CLS_GAP2]
+    allele2_positions = [pos for pos, column_class in enumerate(pattern)
+                         if column_class == _CLS_MISMATCH or column_class == _CLS_GAP1]
+
     # Build extension position sets for each sequence
     # Note: Extension and core positions form a partition of all content positions,
     # so is_core = not is_ext (no need to build separate core position sets)
-    left1, right1 = analysis1.left_extension_count, analysis1.right_extension_count
-    left2, right2 = analysis2.left_extension_count, analysis2.right_extension_count
-
     seq1_ext_positions = (set(allele1_positions[:left1]) |
                           set(allele1_positions[-right1:] if right1 > 0 else []))
     seq2_ext_positions = (set(allele2_positions[:left2]) |
                           set(allele2_positions[-right2:] if right2 > 0 else []))
 
-    # Determine if cores match (for visualization - matched cores show as |)
-    cores_match = analysis1.core_content == analysis2.core_content
-
-    # Choose extension marker based on normalization settings. When the short-HP
+    # Choose extension code based on normalization settings. When the short-HP
     # threshold demoted this variant range to a counted edit, render extension
-    # positions with short_hp_edit so the visualization matches the scoring.
-    short_hp_demoted = bool(score_result and score_result.get('short_hp_edit'))
+    # positions as short-HP edits so the visualization matches the scoring.
     if short_hp_demoted:
-        ext_marker = scoring_format.short_hp_edit
-    elif adjustment_params.normalize_homopolymers:
-        ext_marker = scoring_format.homopolymer_extension
+        ext_code = _CODE_SHORT_HP_EDIT
+    elif normalize_homopolymers:
+        ext_code = _CODE_HP_EXTENSION
     else:
-        ext_marker = scoring_format.indel_extension
+        ext_code = _CODE_INDEL_EXTENSION
 
-    # Generate visualization
-    score_chars = []
+    codes = bytearray()
     seen_core_start = False  # Track if we've seen the first core position (for indel normalization)
 
-    for pos in range(start, end + 1):
-        char1 = seq1_aligned[pos]
-        char2 = seq2_aligned[pos]
-
+    for pos, column_class in enumerate(pattern):
         # Case 1: Dual-gap - both sequences have gap (MSA artifact, not scored)
-        if char1 == '-' and char2 == '-':
-            score_chars.append(scoring_format.dual_gap)
+        if column_class == _CLS_DUAL_GAP:
+            codes.append(_CODE_DUAL_GAP)
             continue
 
         # Case 2: Both have content
-        if char1 != '-' and char2 != '-':
+        if column_class == _CLS_MISMATCH:
             # When homopolymer normalization is disabled, is_ext is always False (all content is core)
-            is_ext1 = adjustment_params.normalize_homopolymers and pos in seq1_ext_positions
-            is_ext2 = adjustment_params.normalize_homopolymers and pos in seq2_ext_positions
+            is_ext1 = normalize_homopolymers and pos in seq1_ext_positions
+            is_ext2 = normalize_homopolymers and pos in seq2_ext_positions
             # Extension and core partition content positions, so is_core = not is_ext
             is_core1 = not is_ext1
             is_core2 = not is_ext2
 
             if is_ext1 and is_ext2:
-                # Both extensions - show extension marker
-                score_chars.append(ext_marker)
+                # Both extensions - show extension code
+                codes.append(ext_code)
             elif is_core1 and is_core2:
                 # Both core - show match or mismatch based on core comparison
-                score_chars.append(scoring_format.match if cores_match else scoring_format.substitution)
+                codes.append(_CODE_MATCH if cores_match else _CODE_SUBSTITUTION)
             else:
                 # One is extension, one is core - show based on whether cores match
                 if cores_match:
-                    # Cores match - show extension marker for seq1's extension, match for seq1's core
-                    score_chars.append(ext_marker if is_ext1 else scoring_format.match)
+                    # Cores match - show extension code for seq1's extension, match for seq1's core
+                    codes.append(ext_code if is_ext1 else _CODE_MATCH)
                 else:
                     # Cores differ - mismatch counted
-                    score_chars.append(scoring_format.substitution)
+                    codes.append(_CODE_SUBSTITUTION)
             continue
 
         # Case 3: seq1 has gap, seq2 has content
-        if char1 == '-':
-            is_ext2 = adjustment_params.normalize_homopolymers and pos in seq2_ext_positions
+        if column_class == _CLS_GAP1:
+            is_ext2 = normalize_homopolymers and pos in seq2_ext_positions
 
             if is_ext2:
-                # seq2 is extension - show extension marker
-                score_chars.append(ext_marker)
+                # seq2 is extension - show extension code
+                codes.append(ext_code)
             else:
                 # seq2 is core - check if cores match (only when HP normalization enabled)
-                if adjustment_params.normalize_homopolymers and cores_match:
-                    # Cores match - seq1 (gap) absorbs extension → show extension marker
-                    score_chars.append(ext_marker)
+                if normalize_homopolymers and cores_match:
+                    # Cores match - seq1 (gap) absorbs extension → show extension code
+                    codes.append(ext_code)
                 else:
-                    # Cores differ or HP normalization disabled - show indel markers
-                    if adjustment_params.normalize_indels and seen_core_start:
-                        score_chars.append(scoring_format.indel_extension)
+                    # Cores differ or HP normalization disabled - show indel codes
+                    if normalize_indels and seen_core_start:
+                        codes.append(_CODE_INDEL_EXTENSION)
                     else:
-                        score_chars.append(scoring_format.indel_start)
+                        codes.append(_CODE_INDEL_START)
                         seen_core_start = True
             continue
 
         # Case 4: seq1 has content, seq2 has gap
-        if char2 == '-':
-            is_ext1 = adjustment_params.normalize_homopolymers and pos in seq1_ext_positions
+        is_ext1 = normalize_homopolymers and pos in seq1_ext_positions
 
-            if is_ext1:
-                # seq1 is extension - show extension marker
-                score_chars.append(ext_marker)
+        if is_ext1:
+            # seq1 is extension - show extension code
+            codes.append(ext_code)
+        else:
+            # seq1 is core - check if cores match (only when HP normalization enabled)
+            if normalize_homopolymers and cores_match:
+                # Cores match - seq1 (core) is the matching core → show match code
+                codes.append(_CODE_MATCH)
             else:
-                # seq1 is core - check if cores match (only when HP normalization enabled)
-                if adjustment_params.normalize_homopolymers and cores_match:
-                    # Cores match - seq1 (core) is the matching core → show match marker
-                    score_chars.append(scoring_format.match)
+                # Cores differ or HP normalization disabled - show indel codes
+                if normalize_indels and seen_core_start:
+                    codes.append(_CODE_INDEL_EXTENSION)
                 else:
-                    # Cores differ or HP normalization disabled - show indel markers
-                    if adjustment_params.normalize_indels and seen_core_start:
-                        score_chars.append(scoring_format.indel_extension)
-                    else:
-                        score_chars.append(scoring_format.indel_start)
-                        seen_core_start = True
-            continue
+                    codes.append(_CODE_INDEL_START)
+                    seen_core_start = True
 
-    return ''.join(score_chars)
+    return bytes(codes)
+
+
+_variant_codes = lru_cache(maxsize=_CACHE_SIZE)(_build_variant_codes)
 
 
 def _analyze_alignment(seq1_aligned, seq2_aligned, adjustment_params=None):
     """
     Unified analysis of alignment extracting variant range information and computing metrics.
 
-    Both adjust_gaps=True and adjust_gaps=False code paths use this function, and
-    score_alignment_metrics() shares its metric computation (_compute_alignment_metrics),
-    ensuring consistent metrics regardless of output mode.
+    Shares its metric computation (_compute_alignment_metrics) with
+    score_alignment() and score_alignment_metrics(), ensuring consistent metrics
+    regardless of output mode.
 
     Returns an AlignmentAnalysis object with all computed metrics and detailed
-    variant range information needed to generate either "annotated" or "adjusted"
-    output alignments.
+    information on every variant range. A variant range is a maximal contiguous
+    run of columns that are not matches, so runs of dual-gap columns are
+    reported too (with empty alleles).
 
     Args:
         seq1_aligned (str): First sequence with gaps ('-') inserted
@@ -1302,10 +1453,35 @@ def _analyze_alignment(seq1_aligned, seq2_aligned, adjustment_params=None):
     if adjustment_params is None:
         adjustment_params = DEFAULT_ADJUSTMENT_PARAMS
 
-    variant_range_infos = []
+    scored_ranges = []
     (identity, edits, scored_positions, seq1_coverage, seq2_coverage,
-     scoring_start, scoring_end) = _compute_alignment_metrics(
-        seq1_aligned, seq2_aligned, adjustment_params, variant_range_infos)
+     scoring_start, scoring_end, _) = _compute_alignment_metrics(
+        seq1_aligned, seq2_aligned, adjustment_params, scored_ranges,
+        include_dual_gap_ranges=True)
+
+    variant_range_infos = []
+    for start, end, allele1, allele2, variant, vr_edits, vr_positions, short_hp in scored_ranges:
+        _, allele1_positions = _extract_allele(seq1_aligned, start, end - 1)
+        _, allele2_positions = _extract_allele(seq2_aligned, start, end - 1)
+        variant_range_infos.append(VariantRangeInfo(
+            start=start,
+            end=end - 1,
+            # Bounding match positions (if within the scoring region)
+            left_bound_pos=start - 1 if start > scoring_start else -1,
+            right_bound_pos=end if end <= scoring_end else -1,
+            allele1=allele1,
+            allele2=allele2,
+            allele1_positions=tuple(allele1_positions),
+            allele2_positions=tuple(allele2_positions),
+            analysis1=variant.analysis1,
+            analysis2=variant.analysis2,
+            score_result={
+                'edits': vr_edits,
+                'scored_positions': vr_positions,
+                'both_pure_extension': variant.both_pure_extension and not short_hp,
+                'short_hp_edit': short_hp,
+            }
+        ))
 
     return AlignmentAnalysis(
         identity=identity,
@@ -1320,141 +1496,220 @@ def _analyze_alignment(seq1_aligned, seq2_aligned, adjustment_params=None):
 
 
 def _compute_alignment_metrics(seq1_aligned, seq2_aligned, adjustment_params,
-                               variant_range_infos=None):
+                               scored_ranges=None, include_dual_gap_ranges=False):
     """
     Single source of truth for alignment metrics.
 
-    Used by _analyze_alignment() (and so by score_alignment()) and by
-    score_alignment_metrics().
+    Used by score_alignment(), score_alignment_metrics() and _analyze_alignment().
 
     Args:
         seq1_aligned (str): First sequence with gaps ('-') inserted
         seq2_aligned (str): Second sequence with gaps ('-') inserted
         adjustment_params (AdjustmentParams): Parameters controlling analysis (not None)
-        variant_range_infos (list, optional): If given, a VariantRangeInfo is appended
-            for each variant range (needed for output generation). If None, the
-            per-range detail is not built.
+        scored_ranges (list, optional): If given, a tuple is appended for each
+            variant range, in order (needed for output generation):
+            (start, end, allele1, allele2, variant, edits, scored_positions, short_hp)
+            where columns [start, end) are the range, variant is its
+            _VariantScore, and edits/scored_positions/short_hp are its
+            contribution after any short-HP demotion.
+        include_dual_gap_ranges (bool): Dual-gap columns never affect the
+            metrics. By default they are skipped: runs made only of dual-gap
+            columns are not visited, and a variant range starts at its first
+            column with content. If True, every maximal run of non-match
+            columns is visited as a variant range, dual-gap columns included.
 
     Returns:
         tuple: (identity, mismatches, scored_positions, seq1_coverage, seq2_coverage,
-                scoring_start, scoring_end)
+                scoring_start, scoring_end, classes)
+            where classes is the column class string from _classify_columns
     """
-    collect = variant_range_infos is not None
-
     # Input validation
-    if len(seq1_aligned) != len(seq2_aligned):
+    alignment_length = len(seq1_aligned)
+    if alignment_length != len(seq2_aligned):
         raise ValueError(f"Aligned sequences must have same length: seq1={len(seq1_aligned)}, seq2={len(seq2_aligned)}")
 
-    total_alignment_length = len(seq1_aligned)
+    handle_iupac = adjustment_params.handle_iupac_overlap
+    classes = _classify_columns(seq1_aligned, seq2_aligned, handle_iupac)
+
+    # Find alignment bounds: first and last column where both sequences have
+    # content (the whole alignment if there is no such column)
+    alignment_end = len(classes.rstrip(_GAP_CLASSES)) - 1
+    if alignment_end < 0:
+        alignment_start = 0
+        alignment_end = alignment_length - 1
+    else:
+        alignment_start = alignment_length - len(classes.lstrip(_GAP_CLASSES))
+
+    # Calculate coverage counts
+    seq1_total_length = alignment_length - seq1_aligned.count('-')
+    seq2_total_length = alignment_length - seq2_aligned.count('-')
+    span_length = alignment_end + 1 - alignment_start
+    if span_length == alignment_length:
+        # No overhang at either end: the whole of each sequence is covered
+        seq1_coverage_positions = seq1_total_length
+        seq2_coverage_positions = seq2_total_length
+    else:
+        seq1_coverage_positions = span_length - seq1_aligned.count('-', alignment_start, alignment_end + 1)
+        seq2_coverage_positions = span_length - seq2_aligned.count('-', alignment_start, alignment_end + 1)
+
+    # Find scoring region (see _find_scoring_region for the rules)
+    if adjustment_params.scoring_mode == ScoringMode.GLOBAL:
+        scoring_start = 0
+        scoring_end = alignment_length - 1
+    else:
+        scoring_start = alignment_start
+        scoring_end = alignment_end
+    end_skip_distance = adjustment_params.end_skip_distance
+    if end_skip_distance != 0:
+        scoring_start, scoring_end = _trim_scoring_region(
+            seq1_aligned, seq2_aligned, scoring_start, scoring_end, end_skip_distance)
+    region_end = scoring_end + 1
+
+    # Variant ranges are maximal runs of non-match columns within the scoring
+    # region. Walk them with bytes.find on two-letter views of the classes:
+    # a range starts at the next 'V' of variant_starts and ends at the next 'M'
+    # of any_variant.
+    any_variant = classes.translate(_ANY_VARIANT_TABLE)
+    if include_dual_gap_ranges or _CLS_DUAL_GAP not in classes:
+        variant_starts = any_variant
+    else:
+        # Start each range at its first column with content. Leading dual-gap
+        # columns hold no characters, are skipped by the repeat-context and
+        # HP-run walks, and are drawn the same inside or outside a range, so
+        # leaving them out changes nothing. Runs of only dual-gap columns have
+        # two empty alleles and always score 0 edits over 0 positions.
+        variant_starts = classes.translate(_CONTENT_VARIANT_TABLE)
+
+    # Every match column in the scoring region is a scored position
     edits = 0
-    scored_positions = 0
+    scored_positions = any_variant.count(b'M', scoring_start, region_end)
 
-    # Find alignment bounds
-    alignment_start = 0
-    alignment_end = total_alignment_length - 1
+    find_start = variant_starts.find
+    start = find_start(b'V', scoring_start, region_end)
+    if start >= 0:
+        find_end = any_variant.find
 
-    for pos in range(total_alignment_length):
-        if seq1_aligned[pos] != '-' and seq2_aligned[pos] != '-':
-            alignment_start = pos
-            break
+        # A variant range has a left bounding match (and so left context) only
+        # if a match column precedes it within the scoring region
+        first_match = find_end(b'M', scoring_start, region_end)
+        if first_match < 0:
+            first_match = region_end
 
-    for pos in range(total_alignment_length - 1, -1, -1):
-        if seq1_aligned[pos] != '-' and seq2_aligned[pos] != '-':
-            alignment_end = pos
-            break
+        max_motif_length = adjustment_params.max_repeat_motif_length
+        normalize_homopolymers = adjustment_params.normalize_homopolymers
+        normalize_indels = adjustment_params.normalize_indels
+        check_short_hp = normalize_homopolymers and adjustment_params.hp_normalize_min_length > 1
+        ascii_sequences = (check_short_hp
+                           and type(seq1_aligned) is str and type(seq2_aligned) is str
+                           and seq1_aligned.isascii() and seq2_aligned.isascii())
 
-    # Calculate coverage counts with C-level str.count instead of a per-char loop
-    seq1_total_length = total_alignment_length - seq1_aligned.count('-')
-    seq2_total_length = total_alignment_length - seq2_aligned.count('-')
-    span1 = seq1_aligned[alignment_start:alignment_end + 1]
-    span2 = seq2_aligned[alignment_start:alignment_end + 1]
-    seq1_coverage_positions = len(span1) - span1.count('-')
-    seq2_coverage_positions = len(span2) - span2.count('-')
+        # Context lookups index and slice the alignment directly when
+        # max_motif_length is an ordinary positive count (it always is with
+        # homopolymer normalization on); otherwise the column walk decides
+        direct_context = type(max_motif_length) is int and max_motif_length >= 1
+        if direct_context:
+            exact_match_run = b'M' * max_motif_length
 
-    # Find scoring region
-    scoring_start, scoring_end = _find_scoring_region(
-        seq1_aligned, seq2_aligned, adjustment_params
-    )
+        # The variant cache is keyed on plain values; anything unusual is
+        # scored directly
+        cacheable = (type(seq1_aligned) is str and type(seq2_aligned) is str
+                     and type(max_motif_length) is int and type(handle_iupac) is bool
+                     and type(normalize_homopolymers) is bool and type(normalize_indels) is bool)
 
-    # Find variant ranges
-    raw_variant_ranges = _find_variant_ranges(
-        seq1_aligned, seq2_aligned, scoring_start, scoring_end,
-        adjustment_params.handle_iupac_overlap
-    )
+        while start >= 0:
+            end = find_end(b'M', start, region_end)
+            if end < 0:
+                end = region_end
 
-    # Process variant ranges (collecting detailed info only if requested)
-    for vr_start, vr_end, left_bound, right_bound in raw_variant_ranges:
-        # Extract alleles (source positions are needed only for output generation)
-        if collect:
-            allele1, allele1_positions = _extract_allele(seq1_aligned, vr_start, vr_end)
-            allele2, allele2_positions = _extract_allele(seq2_aligned, vr_start, vr_end)
-        else:
-            allele1 = seq1_aligned[vr_start:vr_end + 1].replace('-', '')
-            allele2 = seq2_aligned[vr_start:vr_end + 1].replace('-', '')
+            allele1 = seq1_aligned[start:end].replace('-', '')
+            allele2 = seq2_aligned[start:end].replace('-', '')
 
-        # Get context (helpers return the longest available context up to
-        # max_ctx_len characters, or None if none is available)
-        max_ctx_len = adjustment_params.max_repeat_motif_length
-        left_context = None
-        right_context = None
+            # Get context: the longest available run of up to max_motif_length
+            # characters from matching columns on each side, or None. Left
+            # context needs a match column before the range within the scoring
+            # region, right context one after it.
+            left_context = None
+            right_context = None
+            allele_length = len(allele1) + len(allele2)
+            if allele_length == 0:
+                # Only dual gaps: two empty alleles score the same whatever
+                # the context
+                pass
+            elif not direct_context:
+                if first_match < start:
+                    left_context = _left_context(classes, seq1_aligned, start, max_motif_length)
+                if end < region_end:
+                    right_context = _right_context(classes, seq1_aligned, end - 1, max_motif_length)
+            elif end - start == 1 or (len(allele1) <= 1 and len(allele2) <= 1):
+                # A single-character allele is only ever compared with the
+                # nearest context character on each side (see _analyze_allele),
+                # so one character of context is enough. Keeping it to one also
+                # keeps the number of distinct cases small for the cache.
+                if first_match < start:
+                    column_class = classes[start - 1]
+                    if column_class == _CLS_MATCH or column_class == _CLS_SAME_AMBIGUOUS:
+                        left_context = seq1_aligned[start - 1]
+                    elif column_class == _CLS_DUAL_GAP:
+                        left_context = _left_context(classes, seq1_aligned, start, 1)
+                if end < region_end:
+                    # The range ends at a match column
+                    column_class = classes[end]
+                    if column_class == _CLS_MATCH or column_class == _CLS_SAME_AMBIGUOUS:
+                        right_context = seq1_aligned[end]
+            else:
+                # The usual case is a run of exact matches on each side, read
+                # with one slice; anything else goes to the column walk
+                if first_match < start:
+                    if (start >= max_motif_length
+                            and classes[start - max_motif_length:start] == exact_match_run):
+                        left_context = seq1_aligned[start - max_motif_length:start]
+                    else:
+                        left_context = _left_context(classes, seq1_aligned, start, max_motif_length)
+                if end < region_end:
+                    if classes[end:end + max_motif_length] == exact_match_run:
+                        right_context = seq1_aligned[end:end + max_motif_length]
+                    else:
+                        right_context = _right_context(classes, seq1_aligned, end - 1, max_motif_length)
 
-        if left_bound >= 0:
-            left_context = _extract_left_context(
-                seq1_aligned, seq2_aligned, vr_start, max_ctx_len)
+            # Analyze the alleles and score the variant range
+            if cacheable and allele_length <= _VARIANT_CACHE_MAX_ALLELES:
+                variant = _score_variant(
+                    allele1, allele2, left_context, right_context,
+                    max_motif_length, handle_iupac, normalize_homopolymers, normalize_indels)
+            else:
+                variant = _new_variant_score(
+                    allele1, allele2, left_context, right_context,
+                    max_motif_length, handle_iupac, normalize_homopolymers, normalize_indels)
+            vr_edits = variant.edits
+            vr_positions = variant.scored_positions
 
-        if right_bound >= 0:
-            right_context = _extract_right_context(
-                seq1_aligned, seq2_aligned, vr_end, max_ctx_len)
+            # Short-HP threshold check: if the shorter HP run is below the
+            # configured minimum, demote pure-extension variant ranges to a
+            # counted edit. Applies to pure-extension cases only (where the
+            # length diff would otherwise normalize to 0 edits).
+            short_hp = False
+            if (check_short_hp
+                    and (variant.analysis1.is_pure_extension or variant.analysis2.is_pure_extension)
+                    and _short_hp_demote(allele1, variant.analysis1, allele2, variant.analysis2,
+                                         adjustment_params, seq1_aligned, seq2_aligned,
+                                         start, end - 1, ascii_sequences)):
+                short_hp = True
+                total_len = max(len(allele1), len(allele2))
+                if total_len == 0:
+                    vr_edits = vr_positions = 0
+                elif normalize_indels:
+                    vr_edits = vr_positions = 1
+                else:
+                    vr_edits = vr_positions = total_len
 
-        # Analyze alleles
-        analysis1 = _analyze_allele(
-            allele1, left_context, right_context,
-            adjustment_params.max_repeat_motif_length,
-            adjustment_params.handle_iupac_overlap
-        )
-        analysis2 = _analyze_allele(
-            allele2, left_context, right_context,
-            adjustment_params.max_repeat_motif_length,
-            adjustment_params.handle_iupac_overlap
-        )
+            edits += vr_edits
+            scored_positions += vr_positions
 
-        # Score the variant range
-        vr_score = _score_variant_range(
-            allele1, analysis1, allele2, analysis2, adjustment_params,
-            seq1_aligned, seq2_aligned, vr_start, vr_end
-        )
+            if scored_ranges is not None:
+                scored_ranges.append((start, end, allele1, allele2, variant,
+                                      vr_edits, vr_positions, short_hp))
 
-        edits += vr_score['edits']
-        scored_positions += vr_score['scored_positions']
-
-        if collect:
-            variant_range_infos.append(VariantRangeInfo(
-                start=vr_start,
-                end=vr_end,
-                left_bound_pos=left_bound,
-                right_bound_pos=right_bound,
-                allele1=allele1,
-                allele2=allele2,
-                allele1_positions=tuple(allele1_positions),
-                allele2_positions=tuple(allele2_positions),
-                analysis1=analysis1,
-                analysis2=analysis2,
-                score_result=vr_score
-            ))
-
-    # Count match positions outside variant ranges, one segment at a time.
-    # Within a segment between variant ranges every column is either a match
-    # or a dual-gap, and a match column cannot contain '-', so dual-gap
-    # columns are exactly the '-' columns of seq1.
-    seg_start = scoring_start
-    for vr_start, vr_end, _, _ in raw_variant_ranges:
-        if vr_start > seg_start:
-            segment = seq1_aligned[seg_start:vr_start]
-            scored_positions += len(segment) - segment.count('-')
-        seg_start = vr_end + 1
-    if seg_start <= scoring_end:
-        segment = seq1_aligned[seg_start:scoring_end + 1]
-        scored_positions += len(segment) - segment.count('-')
+            start = find_start(b'V', end, region_end)
 
     # Calculate coverage
     seq1_coverage = seq1_coverage_positions / seq1_total_length if seq1_total_length > 0 else 0.0
@@ -1464,158 +1719,68 @@ def _compute_alignment_metrics(seq1_aligned, seq2_aligned, adjustment_params,
     identity = 1.0 - (edits / scored_positions) if scored_positions > 0 else 1.0
 
     return (identity, edits, scored_positions, seq1_coverage, seq2_coverage,
-            scoring_start, scoring_end)
+            scoring_start, scoring_end, classes)
 
 
-def _adjust_variant_range(vr_info, adjustment_params):
+# =============================================================================
+# Output generation
+# =============================================================================
+
+_marker_table_memo = None
+
+
+def _marker_table(scoring_format):
     """
-    Adjust a single variant range so gaps match the scoring analysis.
-
-    Uses middle-padded alignment:
-    - Left extensions: pad shorter with gaps at END (closest to core)
-    - Core: left-align, pad shorter with gaps at END
-    - Right extensions: pad shorter with gaps at START (closest to core)
-
-    Args:
-        vr_info: VariantRangeInfo with allele analyses
-        adjustment_params: AdjustmentParams for scoring behavior
+    Build the translation from score codes to a ScoringFormat's markers.
 
     Returns:
-        tuple: (adjusted_seq1_part, adjusted_seq2_part) strings for this variant range
+        A 256-byte table for bytes.translate when every marker is a single
+        Latin-1 character, otherwise a dict for str.translate.
     """
-    analysis1 = vr_info.analysis1
-    analysis2 = vr_info.analysis2
-    allele1 = vr_info.allele1
-    allele2 = vr_info.allele2
+    global _marker_table_memo
 
-    # Extract extension and core portions
-    # When homopolymer normalization is disabled, treat all content as core
-    # (extensions only affect scoring when normalization is enabled, so gap
-    # adjustment should not rewrite positions based on unrecognized extensions)
-    if adjustment_params.normalize_homopolymers:
-        left1 = analysis1.left_extension_count
-        right1 = analysis1.right_extension_count
-        left2 = analysis2.left_extension_count
-        right2 = analysis2.right_extension_count
+    # ScoringFormat is immutable, so the table for the format used last time
+    # (almost always the default) can be reused
+    memo = _marker_table_memo
+    if memo is not None and memo[0] is scoring_format:
+        return memo[1]
+
+    markers = {
+        _CODE_MATCH: scoring_format.match,
+        _CODE_AMBIGUOUS: scoring_format.ambiguous_match,
+        _CLS_EQUIVALENT: scoring_format.ambiguous_match,
+        _CODE_SUBSTITUTION: scoring_format.substitution,
+        _CODE_INDEL_START: scoring_format.indel_start,
+        _CODE_INDEL_EXTENSION: scoring_format.indel_extension,
+        _CODE_HP_EXTENSION: scoring_format.homopolymer_extension,
+        _CODE_SHORT_HP_EDIT: scoring_format.short_hp_edit,
+        _CODE_END_TRIMMED: scoring_format.end_trimmed,
+        _CODE_DUAL_GAP: scoring_format.dual_gap,
+    }
+    if all(type(marker) is str and len(marker) == 1 and ord(marker) < 256
+           for marker in markers.values()):
+        table = bytearray(256)
+        for code, marker in markers.items():
+            table[code] = ord(marker)
+        table = bytes(table)
     else:
-        left1 = right1 = left2 = right2 = 0
+        table = markers
 
-    ext1_left = allele1[:left1] if left1 > 0 else ""
-    ext1_right = allele1[len(allele1) - right1:] if right1 > 0 else ""
-    core1 = analysis1.core_content if adjustment_params.normalize_homopolymers else allele1
-
-    ext2_left = allele2[:left2] if left2 > 0 else ""
-    ext2_right = allele2[len(allele2) - right2:] if right2 > 0 else ""
-    core2 = analysis2.core_content if adjustment_params.normalize_homopolymers else allele2
-
-    result_seq1 = []
-    result_seq2 = []
-
-    # Left extensions (middle-padded: gaps at END, closest to core)
-    max_left = max(len(ext1_left), len(ext2_left))
-    for i in range(max_left):
-        c1 = ext1_left[i] if i < len(ext1_left) else '-'
-        c2 = ext2_left[i] if i < len(ext2_left) else '-'
-        result_seq1.append(c1)
-        result_seq2.append(c2)
-
-    # Core content (left-aligned, shorter padded with gaps at end)
-    max_core = max(len(core1), len(core2))
-    for i in range(max_core):
-        c1 = core1[i] if i < len(core1) else '-'
-        c2 = core2[i] if i < len(core2) else '-'
-        result_seq1.append(c1)
-        result_seq2.append(c2)
-
-    # Right extensions (middle-padded: gaps at START, closest to core)
-    max_right = max(len(ext1_right), len(ext2_right))
-    pad1 = max_right - len(ext1_right)
-    pad2 = max_right - len(ext2_right)
-    for i in range(max_right):
-        c1 = '-' if i < pad1 else ext1_right[i - pad1]
-        c2 = '-' if i < pad2 else ext2_right[i - pad2]
-        result_seq1.append(c1)
-        result_seq2.append(c2)
-
-    return ''.join(result_seq1), ''.join(result_seq2)
+    if type(scoring_format) is ScoringFormat:
+        _marker_table_memo = (scoring_format, table)
+    return table
 
 
-def _adjust_alignment_gaps(seq1_aligned, seq2_aligned, analysis, adjustment_params):
-    """
-    Adjust alignment so gap positions match the variant range scoring analysis.
-
-    This produces a "canonical" alignment where the scoring string is intuitive
-    to interpret position-by-position.
-
-    Algorithm:
-    1. For positions before scoring region: emit as-is (end-trimmed)
-    2. For positions in scoring region:
-       - Match positions: emit both characters as-is
-       - Dual-gap positions: emit both gaps as-is
-       - Variant range: emit adjusted variant range
-    3. For positions after scoring region: emit as-is (end-trimmed)
-
-    Args:
-        seq1_aligned, seq2_aligned: Original aligned sequences
-        analysis: AlignmentAnalysis from _analyze_alignment
-        adjustment_params: AdjustmentParams for scoring behavior
-
-    Returns:
-        tuple: (adjusted_seq1, adjusted_seq2, vr_spans)
-            vr_spans is a list of (adj_start, adj_end_inclusive, vr_info) tuples
-            mapping each variant range to its position span in the adjusted
-            alignment, used to render gap columns according to how they were
-            scored (extension vs. counted core indel vs. short-HP demotion).
-    """
-    result_seq1 = []
-    result_seq2 = []
-    vr_spans = []
-    adj_offset = 0
-
-    # Build lookup for variant range start positions
-    vr_by_start = {vr.start: vr for vr in analysis.variant_ranges}
-    vr_ends = {vr.start: vr.end for vr in analysis.variant_ranges}
-
-    pos = 0
-    alignment_length = len(seq1_aligned)
-
-    while pos < alignment_length:
-        # Outside scoring region: emit as-is
-        if pos < analysis.scoring_start or pos > analysis.scoring_end:
-            result_seq1.append(seq1_aligned[pos])
-            result_seq2.append(seq2_aligned[pos])
-            adj_offset += 1
-            pos += 1
-            continue
-
-        # Check if this position starts a variant range
-        if pos in vr_by_start:
-            vr_info = vr_by_start[pos]
-            vr_end = vr_ends[pos]
-
-            # Emit adjusted variant range
-            adj_seq1, adj_seq2 = _adjust_variant_range(vr_info, adjustment_params)
-            result_seq1.append(adj_seq1)
-            result_seq2.append(adj_seq2)
-
-            vr_adj_len = len(adj_seq1)
-            vr_spans.append((adj_offset, adj_offset + vr_adj_len - 1, vr_info))
-            adj_offset += vr_adj_len
-
-            # Skip to end of variant range
-            pos = vr_end + 1
-            continue
-
-        # Match position or dual-gap: emit as-is
-        result_seq1.append(seq1_aligned[pos])
-        result_seq2.append(seq2_aligned[pos])
-        adj_offset += 1
-        pos += 1
-
-    return ''.join(result_seq1), ''.join(result_seq2), vr_spans
+def _codes_to_markers(codes, scoring_format):
+    """Turn a bytes string of score codes into the score string for a ScoringFormat."""
+    table = _marker_table(scoring_format)
+    if type(table) is bytes:
+        return codes.translate(table).decode('latin-1')
+    return codes.decode('ascii').translate(table)
 
 
-def _generate_annotated_score_string(seq1_aligned, seq2_aligned, analysis, adjustment_params, scoring_format):
+def _generate_annotated_score_string(classes, scored_ranges, scoring_start, scoring_end,
+                                     adjustment_params, scoring_format):
     """
     Generate "annotated" score string for original alignment (adjust_gaps=False).
 
@@ -1624,114 +1789,182 @@ def _generate_annotated_score_string(seq1_aligned, seq2_aligned, analysis, adjus
     positions were scored using the unified analysis.
 
     Args:
-        seq1_aligned, seq2_aligned: Original aligned sequences (unchanged)
-        analysis: AlignmentAnalysis from _analyze_alignment
+        classes: Column classes of the alignment (from _compute_alignment_metrics)
+        scored_ranges: Variant ranges from _compute_alignment_metrics
+        scoring_start, scoring_end: Scoring region boundaries (inclusive)
         adjustment_params: AdjustmentParams for scoring behavior
         scoring_format: ScoringFormat for visualization
 
     Returns:
         str: Scoring visualization string matching original alignment length
     """
-    total_length = len(seq1_aligned)
-    score_chars = []
+    normalize_homopolymers = adjustment_params.normalize_homopolymers
+    normalize_indels = adjustment_params.normalize_indels
+    cacheable = type(normalize_homopolymers) is bool and type(normalize_indels) is bool
 
-    # Add end-trimmed markers for positions before scoring region
-    score_chars.append(scoring_format.end_trimmed * analysis.scoring_start)
+    # Add end-trimmed codes for positions before scoring region
+    pieces = [bytes([_CODE_END_TRIMMED]) * scoring_start]
+    append = pieces.append
 
-    handle_iupac = adjustment_params.handle_iupac_overlap
-    match_marker = scoring_format.match
+    # Process the scoring region: variant ranges interleaved with the columns
+    # between them. Those in-between columns are matches or dual gaps, whose
+    # class bytes already are their score codes.
+    seg_start = scoring_start
+    for start, end, _, _, variant, _, _, short_hp in scored_ranges:
+        if start > seg_start:
+            append(classes[seg_start:start])
 
-    def emit_match_segment(start, stop):
-        """Emit markers for columns [start, stop): all matches or dual-gaps.
+        if cacheable and end - start <= _OUTPUT_CACHE_MAX_SPAN:
+            append(_variant_codes(classes[start:end], variant.shape, short_hp,
+                                  normalize_homopolymers, normalize_indels))
+        else:
+            append(_build_variant_codes(classes[start:end], variant.shape, short_hp,
+                                        normalize_homopolymers, normalize_indels))
+        seg_start = end
 
-        Fast path: when the segment slices are equal and contain only standard
-        nucleotides, every column is an exact match - emit in bulk. Otherwise
-        fall back to per-column classification (ambiguity codes, case
-        differences, dual-gaps).
-        """
-        seg1 = seq1_aligned[start:stop]
-        if seg1 == seq2_aligned[start:stop] and not (set(seg1) - _STANDARD_NUCS):
-            score_chars.append(match_marker * (stop - start))
-            return
-        for pos in range(start, stop):
-            char1, char2 = seq1_aligned[pos], seq2_aligned[pos]
-            if char1 == '-' and char2 == '-':
-                # Dual-gap (MSA artifact - not scored)
-                score_chars.append(scoring_format.dual_gap)
-            else:
-                # Match position - check for ambiguous match
-                is_match, is_ambiguous = _are_nucleotides_equivalent(
-                    char1, char2, handle_iupac)
-                if is_ambiguous:
-                    score_chars.append(scoring_format.ambiguous_match)
-                else:
-                    score_chars.append(match_marker)
+    if seg_start <= scoring_end:
+        append(classes[seg_start:scoring_end + 1])
 
-    # Process the scoring region: variant ranges interleaved with match segments
-    seg_start = analysis.scoring_start
-    for vr_info in analysis.variant_ranges:
-        if vr_info.start > seg_start:
-            emit_match_segment(seg_start, vr_info.start)
+    # Add end-trimmed codes for positions after scoring region
+    append(bytes([_CODE_END_TRIMMED]) * (len(classes) - 1 - scoring_end))
 
-        # Generate score string for this variant range using existing function
-        vr_score_str = _generate_variant_score_string(
-            seq1_aligned, seq2_aligned, vr_info.start, vr_info.end,
-            vr_info.analysis1, vr_info.analysis2,
-            vr_info.allele1_positions, vr_info.allele2_positions,
-            scoring_format, adjustment_params, vr_info.score_result
-        )
-        score_chars.append(vr_score_str)
-        seg_start = vr_info.end + 1
-
-    if seg_start <= analysis.scoring_end:
-        emit_match_segment(seg_start, analysis.scoring_end + 1)
-
-    # Add end-trimmed markers for positions after scoring region
-    score_chars.append(scoring_format.end_trimmed * (total_length - 1 - analysis.scoring_end))
-
-    return ''.join(score_chars)
+    return _codes_to_markers(b''.join(pieces), scoring_format)
 
 
-def _generate_annotated_output(seq1_aligned, seq2_aligned, analysis, adjustment_params, scoring_format):
+def _build_adjusted_variant(allele1, allele2, core1, core2, shape, short_hp_demoted,
+                            normalize_homopolymers, normalize_indels, handle_iupac):
     """
-    Generate AlignmentResult for adjust_gaps=False using original alignment strings.
+    Adjust a single variant range so gaps match the scoring analysis, and
+    generate the score codes for the adjusted columns.
 
-    The alignment strings are preserved as-is. The score string is generated to
-    reflect how positions were scored using the unified analysis.
+    Uses middle-padded alignment:
+    - Left extensions: pad shorter with gaps at END (closest to core)
+    - Core: left-align, pad shorter with gaps at END
+    - Right extensions: pad shorter with gaps at START (closest to core)
+
+    Gap columns are coded according to how they were scored:
+    - short-HP demoted range: short-HP edit for all gap columns
+    - extension block (left/right of core): extension (not counted)
+    - core block: counted indel -> indel start for the first gap column, indel
+      extension for the rest when normalize_indels (matching the annotated
+      visualization)
 
     Args:
-        seq1_aligned, seq2_aligned: Original aligned sequences
-        analysis: AlignmentAnalysis from _analyze_alignment
-        adjustment_params: AdjustmentParams for scoring behavior
-        scoring_format: ScoringFormat for visualization
+        allele1, allele2: Non-gap content of each sequence in the variant range
+        core1, core2: Core content of each allele from its AlleleAnalysis
+        shape: (left1, right1, left2, right2, cores_match) from the allele
+            analyses (see _VariantScore)
+        short_hp_demoted: Whether the short-HP threshold demoted this range
+        normalize_homopolymers: Whether repeat extensions are normalized away
+        normalize_indels: Whether contiguous indels count as a single edit
+        handle_iupac: Whether to use IUPAC intersection matching
 
     Returns:
-        AlignmentResult: Result with original alignment strings and annotated score string
+        tuple: (adjusted_seq1_part, adjusted_seq2_part, codes) for this variant range
     """
-    score_aligned = _generate_annotated_score_string(
-        seq1_aligned, seq2_aligned, analysis, adjustment_params, scoring_format
-    )
+    # Extract extension and core portions
+    # When homopolymer normalization is disabled, treat all content as core
+    # (extensions only affect scoring when normalization is enabled, so gap
+    # adjustment should not rewrite positions based on unrecognized extensions)
+    if normalize_homopolymers:
+        left1, right1, left2, right2, _ = shape
+    else:
+        left1 = right1 = left2 = right2 = 0
+        core1 = allele1
+        core2 = allele2
 
-    return AlignmentResult(
-        identity=analysis.identity,
-        mismatches=analysis.mismatches,
-        scored_positions=analysis.scored_positions,
-        seq1_coverage=analysis.seq1_coverage,
-        seq2_coverage=analysis.seq2_coverage,
-        seq1_aligned=seq1_aligned,
-        seq2_aligned=seq2_aligned,
-        score_aligned=score_aligned
-    )
+    ext1_left = allele1[:left1] if left1 > 0 else ""
+    ext1_right = allele1[len(allele1) - right1:] if right1 > 0 else ""
+
+    ext2_left = allele2[:left2] if left2 > 0 else ""
+    ext2_right = allele2[len(allele2) - right2:] if right2 > 0 else ""
+
+    # Left extensions (middle-padded: gaps at END, closest to core), then core
+    # content (left-aligned, shorter padded with gaps at end), then right
+    # extensions (middle-padded: gaps at START, closest to core)
+    max_left = max(len(ext1_left), len(ext2_left))
+    max_core = max(len(core1), len(core2))
+    max_right = max(len(ext1_right), len(ext2_right))
+    adjusted1 = (ext1_left.ljust(max_left, '-') + core1.ljust(max_core, '-')
+                 + ext1_right.rjust(max_right, '-'))
+    adjusted2 = (ext2_left.ljust(max_left, '-') + core2.ljust(max_core, '-')
+                 + ext2_right.rjust(max_right, '-'))
+
+    # Where the core block sits within the adjusted columns
+    left_ext_len = max(left1, left2)
+    core_len = max_core
+
+    codes = bytearray()
+    seen_core_indel = False
+    for offset, (char1, char2) in enumerate(zip(adjusted1, adjusted2)):
+        gap1 = char1 == '-'
+        gap2 = char2 == '-'
+
+        if gap1 and gap2:
+            codes.append(_CODE_DUAL_GAP)
+        elif not gap1 and not gap2:
+            # Both have content - check if they match
+            is_match, is_ambiguous = _are_nucleotides_equivalent(char1, char2, handle_iupac)
+            if is_match:
+                codes.append(_CODE_AMBIGUOUS if is_ambiguous else _CODE_MATCH)
+            else:
+                codes.append(_CODE_SUBSTITUTION)
+        elif short_hp_demoted:
+            codes.append(_CODE_SHORT_HP_EDIT)
+        elif left_ext_len <= offset < left_ext_len + core_len:
+            # Core indel - counted as an edit
+            if normalize_indels and seen_core_indel:
+                codes.append(_CODE_INDEL_EXTENSION)
+            else:
+                codes.append(_CODE_INDEL_START)
+                seen_core_indel = True
+        else:
+            # Extension block - normalized away, not counted
+            codes.append(_CODE_HP_EXTENSION)
+
+    return adjusted1, adjusted2, bytes(codes)
 
 
-def _generate_adjusted_score_string(adj_seq1, adj_seq2, analysis, adjustment_params, scoring_format,
-                                     vr_spans=None):
+_adjusted_variant = lru_cache(maxsize=_CACHE_SIZE)(_build_adjusted_variant)
+
+
+# Score codes for columns left as they are in the gap-adjusted alignment, by
+# column class. A gap in one sequence there (unaligned flanks / end-trimmed
+# regions) reads as a repeat continuation of adjacent context, so it is drawn
+# extension-style. Indexed by whether homopolymers are normalized.
+_UNADJUSTED_CODE_TABLES = tuple(
+    _class_translation({
+        _CLS_MATCH: _CODE_MATCH,
+        _CLS_SAME_AMBIGUOUS: _CODE_AMBIGUOUS,
+        _CLS_EQUIVALENT: _CODE_AMBIGUOUS,
+        _CLS_MISMATCH: _CODE_SUBSTITUTION,
+        _CLS_GAP1: gap_code,
+        _CLS_GAP2: gap_code,
+        _CLS_DUAL_GAP: _CODE_DUAL_GAP,
+    }, 0)
+    for gap_code in (_CODE_INDEL_EXTENSION, _CODE_HP_EXTENSION)
+)
+_DUAL_GAP_CODE = bytes([_CODE_DUAL_GAP])
+
+
+def _generate_adjusted_output(seq1_aligned, seq2_aligned, classes, scored_ranges,
+                              scoring_start, scoring_end, adjustment_params, scoring_format):
     """
-    Generate intuitive score string for gap-adjusted alignment.
+    Adjust alignment so gap positions match the variant range scoring analysis,
+    and generate its score string.
 
-    In the adjusted alignment, gap positions naturally align with the scoring
-    analysis, making the visualization more intuitive. This function generates
-    a score string where:
+    This produces a "canonical" alignment where the scoring string is intuitive
+    to interpret position-by-position.
+
+    Algorithm:
+    1. For positions before scoring region: emit as-is (end-trimmed)
+    2. For positions in scoring region:
+       - Match positions: emit both characters as-is
+       - Dual-gap positions: dropped
+       - Variant range: emit adjusted variant range
+    3. For positions after scoring region: emit as-is (end-trimmed)
+
+    In the score string:
     - Extension positions show extension marker (=)
     - Core positions show match (|) or mismatch ( )
     - Match positions show match (|) or ambiguous match (=)
@@ -1739,135 +1972,77 @@ def _generate_adjusted_score_string(adj_seq1, adj_seq2, analysis, adjustment_par
     - Positions inside a short-HP demoted variant range use short_hp_edit
 
     Args:
-        adj_seq1, adj_seq2: Gap-adjusted aligned sequences
-        analysis: AlignmentAnalysis from _analyze_alignment
-        adjustment_params: AdjustmentParams for scoring behavior
-        scoring_format: ScoringFormat for visualization
-        vr_spans: List of (adj_start, adj_end, vr_info) inclusive tuples from
-                  _adjust_alignment_gaps mapping variant ranges to adjusted
-                  alignment positions.
-
-    Returns:
-        str: Scoring visualization string for adjusted alignment
-    """
-    adj_length = len(adj_seq1)
-    score_chars = []
-
-    # Precompute the marker for every single-gap column inside a variant range,
-    # based on how that column was scored:
-    # - short-HP demoted range: short_hp_edit for all gap columns
-    # - extension block (left/right of core): extension marker (not counted)
-    # - core block: counted indel -> indel_start for the first gap column,
-    #   indel_extension for the rest when normalize_indels (matching the
-    #   annotated visualization)
-    gap_markers = {}
-    if vr_spans:
-        for adj_start, adj_end, vr_info in vr_spans:
-            analysis1, analysis2 = vr_info.analysis1, vr_info.analysis2
-            # Mirror the layout logic of _adjust_variant_range
-            if adjustment_params.normalize_homopolymers:
-                left_ext_len = max(analysis1.left_extension_count,
-                                   analysis2.left_extension_count)
-                core_len = max(len(analysis1.core_content), len(analysis2.core_content))
-            else:
-                left_ext_len = 0
-                core_len = max(len(vr_info.allele1), len(vr_info.allele2))
-
-            short_hp_demoted = bool(vr_info.score_result.get('short_hp_edit'))
-            seen_core_indel = False
-            for offset in range(adj_end - adj_start + 1):
-                pos = adj_start + offset
-                gap1 = adj_seq1[pos] == '-'
-                gap2 = adj_seq2[pos] == '-'
-                if gap1 == gap2:
-                    continue  # both content or dual-gap: handled by main loop
-                if short_hp_demoted:
-                    gap_markers[pos] = scoring_format.short_hp_edit
-                elif left_ext_len <= offset < left_ext_len + core_len:
-                    # Core indel - counted as an edit
-                    if adjustment_params.normalize_indels and seen_core_indel:
-                        gap_markers[pos] = scoring_format.indel_extension
-                    else:
-                        gap_markers[pos] = scoring_format.indel_start
-                        seen_core_indel = True
-                else:
-                    # Extension block - normalized away, not counted
-                    gap_markers[pos] = scoring_format.homopolymer_extension
-
-    for pos in range(adj_length):
-        char1 = adj_seq1[pos]
-        char2 = adj_seq2[pos]
-
-        # Dual-gap (should be rare in adjusted alignment within scoring region)
-        if char1 == '-' and char2 == '-':
-            score_chars.append(scoring_format.dual_gap)
-            continue
-
-        # Both have content
-        if char1 != '-' and char2 != '-':
-            # Check if they match
-            is_match, is_ambiguous = _are_nucleotides_equivalent(
-                char1, char2, adjustment_params.handle_iupac_overlap)
-            if is_match:
-                if is_ambiguous:
-                    score_chars.append(scoring_format.ambiguous_match)
-                else:
-                    score_chars.append(scoring_format.match)
-            else:
-                score_chars.append(scoring_format.substitution)
-            continue
-
-        # One has content, one has gap - render according to how it was scored.
-        # Gap columns outside any variant range (unaligned flanks / end-trimmed
-        # regions) keep the extension-style rendering: in the adjusted alignment
-        # they read as repeat continuations of adjacent context.
-        marker = gap_markers.get(pos)
-        if marker is None:
-            marker = (scoring_format.homopolymer_extension
-                      if adjustment_params.normalize_homopolymers
-                      else scoring_format.indel_extension)
-        score_chars.append(marker)
-
-    return ''.join(score_chars)
-
-
-def _generate_adjusted_output(seq1_aligned, seq2_aligned, analysis, adjustment_params, scoring_format):
-    """
-    Generate AlignmentResult for adjust_gaps=True with gap-adjusted alignment.
-
-    The alignment is adjusted so gap positions match the scoring analysis,
-    making the visualization more intuitive to interpret position-by-position.
-
-    Args:
         seq1_aligned, seq2_aligned: Original aligned sequences
-        analysis: AlignmentAnalysis from _analyze_alignment
+        classes: Column classes of the alignment (from _compute_alignment_metrics)
+        scored_ranges: Variant ranges from _compute_alignment_metrics
+        scoring_start, scoring_end: Scoring region boundaries (inclusive)
         adjustment_params: AdjustmentParams for scoring behavior
         scoring_format: ScoringFormat for visualization
 
     Returns:
-        AlignmentResult: Result with adjusted alignment strings and intuitive score string
+        tuple: (adjusted_seq1, adjusted_seq2, score_aligned)
     """
-    # Adjust the alignment gaps using the analysis
-    adj_seq1, adj_seq2, vr_spans = _adjust_alignment_gaps(
-        seq1_aligned, seq2_aligned, analysis, adjustment_params
-    )
+    normalize_homopolymers = adjustment_params.normalize_homopolymers
+    normalize_indels = adjustment_params.normalize_indels
+    handle_iupac = adjustment_params.handle_iupac_overlap
+    cacheable = (type(seq1_aligned) is str and type(seq2_aligned) is str
+                 and type(handle_iupac) is bool
+                 and type(normalize_homopolymers) is bool and type(normalize_indels) is bool)
 
-    # Generate score string for the adjusted alignment
-    score_aligned = _generate_adjusted_score_string(
-        adj_seq1, adj_seq2, analysis, adjustment_params, scoring_format,
-        vr_spans=vr_spans
-    )
+    unadjusted_codes = classes.translate(
+        _UNADJUSTED_CODE_TABLES[1 if normalize_homopolymers else 0])
 
-    return AlignmentResult(
-        identity=analysis.identity,
-        mismatches=analysis.mismatches,
-        scored_positions=analysis.scored_positions,
-        seq1_coverage=analysis.seq1_coverage,
-        seq2_coverage=analysis.seq2_coverage,
-        seq1_aligned=adj_seq1,
-        seq2_aligned=adj_seq2,
-        score_aligned=score_aligned
-    )
+    if scoring_start > scoring_end:
+        # Nothing is scored, so nothing is adjusted
+        return (seq1_aligned[:], seq2_aligned[:],
+                _codes_to_markers(unadjusted_codes, scoring_format))
+
+    # Positions before the scoring region: emit as-is
+    pieces1 = [seq1_aligned[:scoring_start]]
+    pieces2 = [seq2_aligned[:scoring_start]]
+    code_pieces = [unadjusted_codes[:scoring_start]]
+    has_dual_gaps = _CLS_DUAL_GAP in classes
+
+    def emit_between_ranges(seg_start, seg_end):
+        """Emit columns [seg_start, seg_end) of the scoring region that lie
+        between variant ranges: matches as-is, dual gaps dropped."""
+        if has_dual_gaps and classes.find(_DUAL_GAP_CODE, seg_start, seg_end) >= 0:
+            # These columns are matches or dual gaps, so the only gap
+            # characters in either sequence are the dual gaps
+            pieces1.append(seq1_aligned[seg_start:seg_end].replace('-', ''))
+            pieces2.append(seq2_aligned[seg_start:seg_end].replace('-', ''))
+            code_pieces.append(unadjusted_codes[seg_start:seg_end].replace(_DUAL_GAP_CODE, b''))
+        else:
+            pieces1.append(seq1_aligned[seg_start:seg_end])
+            pieces2.append(seq2_aligned[seg_start:seg_end])
+            code_pieces.append(unadjusted_codes[seg_start:seg_end])
+
+    seg_start = scoring_start
+    for start, end, allele1, allele2, variant, _, _, short_hp in scored_ranges:
+        if start > seg_start:
+            emit_between_ranges(seg_start, start)
+
+        # Emit adjusted variant range
+        build = (_adjusted_variant if cacheable and end - start <= _OUTPUT_CACHE_MAX_SPAN
+                 else _build_adjusted_variant)
+        adjusted1, adjusted2, codes = build(
+            allele1, allele2, variant.analysis1.core_content, variant.analysis2.core_content,
+            variant.shape, short_hp, normalize_homopolymers, normalize_indels, handle_iupac)
+        pieces1.append(adjusted1)
+        pieces2.append(adjusted2)
+        code_pieces.append(codes)
+        seg_start = end
+
+    if seg_start <= scoring_end:
+        emit_between_ranges(seg_start, scoring_end + 1)
+
+    # Positions after the scoring region: emit as-is
+    pieces1.append(seq1_aligned[scoring_end + 1:])
+    pieces2.append(seq2_aligned[scoring_end + 1:])
+    code_pieces.append(unadjusted_codes[scoring_end + 1:])
+
+    return (''.join(pieces1), ''.join(pieces2),
+            _codes_to_markers(b''.join(code_pieces), scoring_format))
 
 
 def score_alignment(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_format=None,
@@ -1916,19 +2091,33 @@ def score_alignment(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_
         scoring_format = DEFAULT_SCORING_FORMAT
 
     # Single analysis pass - computes all metrics using unified logic
-    analysis = _analyze_alignment(seq1_aligned, seq2_aligned, adjustment_params)
+    scored_ranges = []
+    (identity, edits, scored_positions, seq1_coverage, seq2_coverage,
+     scoring_start, scoring_end, classes) = _compute_alignment_metrics(
+        seq1_aligned, seq2_aligned, adjustment_params, scored_ranges)
 
     # Generate output based on adjust_gaps mode
     if adjust_gaps:
         # Adjusted output: gap positions match scoring analysis
-        return _generate_adjusted_output(
-            seq1_aligned, seq2_aligned, analysis, adjustment_params, scoring_format
-        )
+        seq1_aligned, seq2_aligned, score_aligned = _generate_adjusted_output(
+            seq1_aligned, seq2_aligned, classes, scored_ranges,
+            scoring_start, scoring_end, adjustment_params, scoring_format)
     else:
-        # Stuffed output: original alignment with annotated scoring visualization
-        return _generate_annotated_output(
-            seq1_aligned, seq2_aligned, analysis, adjustment_params, scoring_format
-        )
+        # Annotated output: original alignment with annotated scoring visualization
+        score_aligned = _generate_annotated_score_string(
+            classes, scored_ranges, scoring_start, scoring_end,
+            adjustment_params, scoring_format)
+
+    return AlignmentResult(
+        identity=identity,
+        mismatches=edits,
+        scored_positions=scored_positions,
+        seq1_coverage=seq1_coverage,
+        seq2_coverage=seq2_coverage,
+        seq1_aligned=seq1_aligned,
+        seq2_aligned=seq2_aligned,
+        score_aligned=score_aligned
+    )
 
 
 def score_alignment_metrics(seq1_aligned, seq2_aligned, adjustment_params=None):
@@ -1961,7 +2150,7 @@ def score_alignment_metrics(seq1_aligned, seq2_aligned, adjustment_params=None):
         adjustment_params = DEFAULT_ADJUSTMENT_PARAMS
 
     (identity, edits, scored_positions, seq1_coverage, seq2_coverage,
-     _, _) = _compute_alignment_metrics(seq1_aligned, seq2_aligned, adjustment_params)
+     _, _, _) = _compute_alignment_metrics(seq1_aligned, seq2_aligned, adjustment_params)
 
     return AlignmentMetrics(
         identity=identity,
@@ -1970,6 +2159,77 @@ def score_alignment_metrics(seq1_aligned, seq2_aligned, adjustment_params=None):
         seq1_coverage=seq1_coverage,
         seq2_coverage=seq2_coverage,
     )
+
+
+_CIGAR_DIGITS = '0123456789'
+_CIGAR_DELETE_DIGITS = str.maketrans('', '', _CIGAR_DIGITS)
+_CIGAR_OPS_TO_SPACES = str.maketrans('=XDI', '    ')
+
+
+def _expand_alignment(align_result, query, target):
+    """
+    Build the gapped query and target strings for an edlib alignment.
+
+    Gives the same two strings as edlib.getNiceAlignment() (which also builds
+    a match line this module never reads, one string concatenation per CIGAR
+    operation).
+
+    Args:
+        align_result: Result of edlib.align(query, target, ..., task="path")
+        query, target: The sequences that were aligned
+
+    Returns:
+        tuple: (query_aligned, target_aligned)
+    """
+    cigar = align_result.get('cigar')
+    locations = align_result.get('locations')
+    if (type(cigar) is str and cigar and locations
+            and type(query) is str and type(target) is str):
+        operations = cigar.translate(_CIGAR_DELETE_DIGITS)
+        lengths = cigar.translate(_CIGAR_OPS_TO_SPACES).split()
+        # Well-formed means lengths and operations strictly alternate, with
+        # nothing else in the string
+        if (len(lengths) == len(operations) and cigar[0] in _CIGAR_DIGITS
+                and cigar[-1] in '=XDI' and cigar.isascii()
+                and not operations.strip('=XDI')):
+            target_pos = locations[0][0]
+            if target_pos is None:
+                target_pos = 0
+            query_pos = 0
+
+            # A gap in one sequence does not interrupt the other, so each
+            # aligned string is contiguous slices of its sequence with gap
+            # runs in between: the query is cut at deletions, the target at
+            # insertions.
+            query_parts = []
+            target_parts = []
+            query_slice_start = query_pos
+            target_slice_start = target_pos
+
+            for length, operation in zip(map(int, lengths), operations):
+                if operation == '=' or operation == 'X':
+                    query_pos += length
+                    target_pos += length
+                elif operation == 'D':
+                    # Target characters opposite a gap in the query
+                    query_parts.append(query[query_slice_start:query_pos])
+                    query_parts.append('-' * length)
+                    query_slice_start = query_pos
+                    target_pos += length
+                else:
+                    # 'I': query characters opposite a gap in the target
+                    target_parts.append(target[target_slice_start:target_pos])
+                    target_parts.append('-' * length)
+                    target_slice_start = target_pos
+                    query_pos += length
+
+            query_parts.append(query[query_slice_start:query_pos])
+            target_parts.append(target[target_slice_start:target_pos])
+            return ''.join(query_parts), ''.join(target_parts)
+
+    # Anything unexpected: let edlib handle (or reject) it
+    alignment = edlib.getNiceAlignment(align_result, query, target)
+    return alignment['query_aligned'], alignment['target_aligned']
 
 
 def _align_nw(seq1, seq2):
@@ -1993,10 +2253,10 @@ def _align_nw(seq1, seq2):
     if result['editDistance'] == -1:
         return None
 
-    alignment = edlib.getNiceAlignment(result, seq1, seq2)
+    aligned_seq1, aligned_seq2 = _expand_alignment(result, seq1, seq2)
     return {
-        'aligned_seq1': alignment['query_aligned'],
-        'aligned_seq2': alignment['target_aligned'],
+        'aligned_seq1': aligned_seq1,
+        'aligned_seq2': aligned_seq2,
     }
 
 
@@ -2079,9 +2339,7 @@ def align_edlib_bidirectional(seq1, seq2):
         return None  # Sentinel value for failed alignment
 
     # Step 8: Get nice alignment
-    alignment = edlib.getNiceAlignment(result, current_seq1, current_seq2)
-    seq1_aligned = alignment['query_aligned']
-    seq2_aligned = alignment['target_aligned']
+    seq1_aligned, seq2_aligned = _expand_alignment(result, current_seq1, current_seq2)
 
     # Step 9: Re-attach seq2 (target) flanks left uncovered by the HW alignment.
     # HW mode aligns the query to a substring of the target; target regions

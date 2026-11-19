@@ -225,9 +225,9 @@ class TestScoreAlignmentMetricsBasics:
         def forbidden(*args, **kwargs):
             raise AssertionError("visualization code called from score_alignment_metrics")
 
-        for name in ("_generate_annotated_output", "_generate_adjusted_output",
-                     "_generate_annotated_score_string", "_generate_adjusted_score_string",
-                     "_generate_variant_score_string", "_adjust_alignment_gaps",
+        for name in ("_generate_annotated_score_string", "_generate_adjusted_output",
+                     "_build_variant_codes", "_build_adjusted_variant",
+                     "_codes_to_markers", "_marker_table",
                      "_extract_allele", "VariantRangeInfo", "AlignmentResult"):
             monkeypatch.setattr(adjusted_identity, name, forbidden)
 
