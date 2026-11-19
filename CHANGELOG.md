@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+- **Packaging**: the license is now declared as the SPDX expression `BSD-2-Clause`, supplied from `setup.py` instead of the `license = {file = "LICENSE"}` table in `pyproject.toml`, which setuptools has deprecated
+  - Declaring it in `setup.py` keeps source builds working on Python 3.8: the last setuptools that runs there (75.3) rejects the SPDX string form in `pyproject.toml`
+  - No change to the installed code. Package metadata now carries `License-Expression: BSD-2-Clause` in place of the full license text; the `LICENSE` file still ships in both the wheel and the source distribution
+
 ## Version 0.2.11
 - **Performance**: scoring is several times faster, with identical output. Measured on real data against 0.2.10 (per pair, single thread):
   - `score_alignment_metrics()` on MSA rows with dual-gap columns already removed (how gaphack calls it): 6x faster (64 -> 11 us); 4.4x with `hp_normalize_min_length=6` (71 -> 16 us)

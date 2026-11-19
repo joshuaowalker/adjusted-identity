@@ -5,6 +5,19 @@ Setup script for adjusted-identity package.
 
 from setuptools import setup, find_packages
 import os
+import setuptools
+
+# The license is declared here rather than in pyproject.toml so that one source
+# tree builds under both old and new setuptools. Versions from 77 on take an
+# SPDX expression and have deprecated the older pyproject.toml form
+# (license = {file = "LICENSE"}); 75.3, the last version that runs on Python
+# 3.8, rejects an SPDX string in pyproject.toml and only knows the plain
+# "license" field. Once Python 3.8 support is dropped this can become
+# license = "BSD-2-Clause" in pyproject.toml.
+if int(setuptools.__version__.split(".")[0]) >= 77:
+    license_args = {"license_expression": "BSD-2-Clause"}
+else:
+    license_args = {"license": "BSD-2-Clause"}
 
 # Read the README file
 def read_readme():
@@ -23,12 +36,12 @@ setup(
     long_description=read_readme(),
     long_description_content_type="text/markdown",
     url="https://github.com/joshuaowalker/adjusted-identity",
+    **license_args,
     packages=find_packages(exclude=["tests", "tests.*"]),
     classifiers=[
         "Development Status :: 4 - Beta",
         "Intended Audience :: Science/Research",
         "Topic :: Scientific/Engineering :: Bio-Informatics",
-        "License :: OSI Approved :: BSD License",
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
