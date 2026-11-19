@@ -107,7 +107,29 @@ class AlignmentResult:
     seq1_aligned: str
     seq2_aligned: str
     score_aligned: str
-    
+
+
+@dataclass(frozen=True)
+class AlignmentMetrics:
+    """Identity metrics for a pre-aligned pair, without visualization strings.
+
+    Returned by score_alignment_metrics(). Each field equals the same-named
+    field of the AlignmentResult that score_alignment() returns for the same
+    aligned inputs and AdjustmentParams, whatever its scoring_format or
+    adjust_gaps arguments.
+
+    Fields:
+        identity: Identity score (0.0-1.0) based on adjustment parameters
+        mismatches: Number of mismatches/edits counted
+        scored_positions: Number of positions used for identity calculation (denominator)
+        seq1_coverage: Fraction of seq1 covered by alignment (0.0-1.0)
+        seq2_coverage: Fraction of seq2 covered by alignment (0.0-1.0)
+    """
+    identity: float
+    mismatches: int
+    scored_positions: int
+    seq1_coverage: float
+    seq2_coverage: float
 
 
 @dataclass(frozen=True)
@@ -1260,9 +1282,9 @@ def _analyze_alignment(seq1_aligned, seq2_aligned, adjustment_params=None):
     """
     Unified analysis of alignment extracting variant range information and computing metrics.
 
-    This is the single source of truth for alignment metrics. Both adjust_gaps=True
-    and adjust_gaps=False code paths use this function, ensuring consistent metrics
-    regardless of output mode.
+    Both adjust_gaps=True and adjust_gaps=False code paths use this function, and
+    score_alignment_metrics() shares its metric computation (_compute_alignment_metrics),
+    ensuring consistent metrics regardless of output mode.
 
     Returns an AlignmentAnalysis object with all computed metrics and detailed
     variant range information needed to generate either "annotated" or "adjusted"
@@ -1279,6 +1301,45 @@ def _analyze_alignment(seq1_aligned, seq2_aligned, adjustment_params=None):
     """
     if adjustment_params is None:
         adjustment_params = DEFAULT_ADJUSTMENT_PARAMS
+
+    variant_range_infos = []
+    (identity, edits, scored_positions, seq1_coverage, seq2_coverage,
+     scoring_start, scoring_end) = _compute_alignment_metrics(
+        seq1_aligned, seq2_aligned, adjustment_params, variant_range_infos)
+
+    return AlignmentAnalysis(
+        identity=identity,
+        mismatches=edits,
+        scored_positions=scored_positions,
+        seq1_coverage=seq1_coverage,
+        seq2_coverage=seq2_coverage,
+        scoring_start=scoring_start,
+        scoring_end=scoring_end,
+        variant_ranges=tuple(variant_range_infos)
+    )
+
+
+def _compute_alignment_metrics(seq1_aligned, seq2_aligned, adjustment_params,
+                               variant_range_infos=None):
+    """
+    Single source of truth for alignment metrics.
+
+    Used by _analyze_alignment() (and so by score_alignment()) and by
+    score_alignment_metrics().
+
+    Args:
+        seq1_aligned (str): First sequence with gaps ('-') inserted
+        seq2_aligned (str): Second sequence with gaps ('-') inserted
+        adjustment_params (AdjustmentParams): Parameters controlling analysis (not None)
+        variant_range_infos (list, optional): If given, a VariantRangeInfo is appended
+            for each variant range (needed for output generation). If None, the
+            per-range detail is not built.
+
+    Returns:
+        tuple: (identity, mismatches, scored_positions, seq1_coverage, seq2_coverage,
+                scoring_start, scoring_end)
+    """
+    collect = variant_range_infos is not None
 
     # Input validation
     if len(seq1_aligned) != len(seq2_aligned):
@@ -1321,13 +1382,15 @@ def _analyze_alignment(seq1_aligned, seq2_aligned, adjustment_params=None):
         adjustment_params.handle_iupac_overlap
     )
 
-    # Process variant ranges and collect detailed info
-    variant_range_infos = []
-
+    # Process variant ranges (collecting detailed info only if requested)
     for vr_start, vr_end, left_bound, right_bound in raw_variant_ranges:
-        # Extract alleles
-        allele1, allele1_positions = _extract_allele(seq1_aligned, vr_start, vr_end)
-        allele2, allele2_positions = _extract_allele(seq2_aligned, vr_start, vr_end)
+        # Extract alleles (source positions are needed only for output generation)
+        if collect:
+            allele1, allele1_positions = _extract_allele(seq1_aligned, vr_start, vr_end)
+            allele2, allele2_positions = _extract_allele(seq2_aligned, vr_start, vr_end)
+        else:
+            allele1 = seq1_aligned[vr_start:vr_end + 1].replace('-', '')
+            allele2 = seq2_aligned[vr_start:vr_end + 1].replace('-', '')
 
         # Get context (helpers return the longest available context up to
         # max_ctx_len characters, or None if none is available)
@@ -1364,21 +1427,20 @@ def _analyze_alignment(seq1_aligned, seq2_aligned, adjustment_params=None):
         edits += vr_score['edits']
         scored_positions += vr_score['scored_positions']
 
-        # Create VariantRangeInfo
-        vr_info = VariantRangeInfo(
-            start=vr_start,
-            end=vr_end,
-            left_bound_pos=left_bound,
-            right_bound_pos=right_bound,
-            allele1=allele1,
-            allele2=allele2,
-            allele1_positions=tuple(allele1_positions),
-            allele2_positions=tuple(allele2_positions),
-            analysis1=analysis1,
-            analysis2=analysis2,
-            score_result=vr_score
-        )
-        variant_range_infos.append(vr_info)
+        if collect:
+            variant_range_infos.append(VariantRangeInfo(
+                start=vr_start,
+                end=vr_end,
+                left_bound_pos=left_bound,
+                right_bound_pos=right_bound,
+                allele1=allele1,
+                allele2=allele2,
+                allele1_positions=tuple(allele1_positions),
+                allele2_positions=tuple(allele2_positions),
+                analysis1=analysis1,
+                analysis2=analysis2,
+                score_result=vr_score
+            ))
 
     # Count match positions outside variant ranges, one segment at a time.
     # Within a segment between variant ranges every column is either a match
@@ -1401,16 +1463,8 @@ def _analyze_alignment(seq1_aligned, seq2_aligned, adjustment_params=None):
     # Calculate identity
     identity = 1.0 - (edits / scored_positions) if scored_positions > 0 else 1.0
 
-    return AlignmentAnalysis(
-        identity=identity,
-        mismatches=edits,
-        scored_positions=scored_positions,
-        seq1_coverage=seq1_coverage,
-        seq2_coverage=seq2_coverage,
-        scoring_start=scoring_start,
-        scoring_end=scoring_end,
-        variant_ranges=tuple(variant_range_infos)
-    )
+    return (identity, edits, scored_positions, seq1_coverage, seq2_coverage,
+            scoring_start, scoring_end)
 
 
 def _adjust_variant_range(vr_info, adjustment_params):
@@ -1875,6 +1929,47 @@ def score_alignment(seq1_aligned, seq2_aligned, adjustment_params=None, scoring_
         return _generate_annotated_output(
             seq1_aligned, seq2_aligned, analysis, adjustment_params, scoring_format
         )
+
+
+def score_alignment_metrics(seq1_aligned, seq2_aligned, adjustment_params=None):
+    """
+    Compute identity metrics for a pre-aligned pair without building visualization strings.
+
+    A faster alternative to score_alignment() for callers that only read the
+    metrics, e.g. when scoring every pair of rows in a multiple sequence alignment.
+
+    Guarantees:
+    - Every field equals the same-named field of score_alignment(seq1_aligned,
+      seq2_aligned, adjustment_params) for every AdjustmentParams combination,
+      whatever score_alignment's scoring_format or adjust_gaps arguments (the
+      metrics never depend on them).
+    - Same input validation: raises ValueError if the aligned sequences differ in length.
+    - Pure and deterministic: the result depends only on the two strings and
+      adjustment_params (a frozen, hashable dataclass), so it can be cached on them.
+
+    Args:
+        seq1_aligned (str): First sequence with gaps ('-') inserted
+        seq2_aligned (str): Second sequence with gaps ('-') inserted
+        adjustment_params (AdjustmentParams, optional): Parameters controlling which adjustments to apply.
+                                                       Defaults to DEFAULT_ADJUSTMENT_PARAMS.
+
+    Returns:
+        AlignmentMetrics: Dataclass containing identity, mismatches, scored_positions,
+        seq1_coverage and seq2_coverage
+    """
+    if adjustment_params is None:
+        adjustment_params = DEFAULT_ADJUSTMENT_PARAMS
+
+    (identity, edits, scored_positions, seq1_coverage, seq2_coverage,
+     _, _) = _compute_alignment_metrics(seq1_aligned, seq2_aligned, adjustment_params)
+
+    return AlignmentMetrics(
+        identity=identity,
+        mismatches=edits,
+        scored_positions=scored_positions,
+        seq1_coverage=seq1_coverage,
+        seq2_coverage=seq2_coverage,
+    )
 
 
 def _align_nw(seq1, seq2):

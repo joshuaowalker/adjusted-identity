@@ -77,6 +77,7 @@ twine upload dist/*
 1. **Data Classes & Enums** (`adjusted_identity/__init__.py`):
    - `ScoringMode` - Enum: `LOCAL` (overlap only) or `GLOBAL` (full alignment with terminal gaps)
    - `AlignmentResult` - Contains alignment results and identity metrics
+   - `AlignmentMetrics` - The five metric fields of `AlignmentResult`, without the strings
    - `ScoringFormat` - Format codes for alignment visualization
    - `AdjustmentParams` - Parameters controlling sequence adjustments (includes `scoring_mode`)
 
@@ -85,6 +86,7 @@ twine upload dist/*
    - `align_edlib_bidirectional()` - Multi-stage semi-global alignment optimization (used by LOCAL mode)
    - `_align_nw()` - Needleman-Wunsch global alignment wrapper (used by GLOBAL mode)
    - `score_alignment()` - Scoring with configurable adjustments
+   - `score_alignment_metrics()` - Metrics-only scoring (returns `AlignmentMetrics`, no display strings); public API used by gaphack. Must stay field-for-field equal to `score_alignment()`
 
 3. **Adjustment Features**:
    - Homopolymer length normalization - ignores differences in homopolymer run lengths
@@ -123,7 +125,11 @@ The test suite is comprehensive and serves as documentation:
    - `TestNWAlignment` - Needleman-Wunsch alignment wrapper
    - `TestGlobalModeEndToEnd` - GLOBAL scoring mode end-to-end tests
 
-3. **test_utilities.py**: Utility function tests
+3. **test_score_alignment_metrics.py**: `score_alignment_metrics()` contract tests
+   - Field-for-field equality with `score_alignment()` (both `adjust_gaps` modes) over a seeded synthetic corpus × every AdjustmentParams combination, plus the local MSA when present
+   - Asserts the metrics path never calls visualization or variant-range-detail code
+
+4. **test_utilities.py**: Utility function tests
    - Data class validation and immutability (including ScoringMode)
    - IUPAC nucleotide equivalence
    - CIGAR string parsing

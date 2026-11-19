@@ -1,5 +1,14 @@
 # Changelog
 
+## Version 0.2.10
+- **New Function**: `score_alignment_metrics(seq1_aligned, seq2_aligned, adjustment_params=None)` returns an `AlignmentMetrics` (identity, mismatches, scored_positions, seq1_coverage, seq2_coverage) for a pre-aligned pair without building the alignment and visualization strings
+  - A supported public API for callers that only read the metrics (e.g. scoring every pair of MSA rows); use it instead of the private `_analyze_alignment`
+  - Every field equals the same-named field of `score_alignment()` for the same inputs and `AdjustmentParams`, whatever `scoring_format` or `adjust_gaps`; tests pin this across every parameter combination
+  - Same input validation as `score_alignment()` (`ValueError` on unequal lengths); pure and deterministic, so results can be cached on the strings plus the frozen `AdjustmentParams`
+  - About 1.8x faster than `score_alignment()` on real MSA rows: besides skipping the strings, it skips the per-variant-range detail that only the visualization uses
+- **New Class**: `AlignmentMetrics` frozen dataclass
+- **Internal**: Metric computation moved from `_analyze_alignment` into `_compute_alignment_metrics`, shared by `_analyze_alignment` (so `score_alignment`) and `score_alignment_metrics`. `_analyze_alignment` keeps its signature and output
+
 ## Version 0.2.9
 - **Performance**: ~1.5x faster `align_and_score()` on real barcode data (validated byte-for-byte identical on 6,580 pinned alignments across 7 parameter configurations and both `adjust_gaps` modes)
   - Coverage and scored-position counting use C-level `str.count` on slices instead of per-character Python loops

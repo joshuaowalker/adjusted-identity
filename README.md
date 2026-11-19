@@ -281,6 +281,8 @@ print(f"MSA identity: {result.identity:.3f}")  # Both G's recognized as homopoly
 - **Consensus context**: Homopolymer detection uses consensus nucleotides from both sequences
 - **Conflict resolution**: When sequences disagree at context positions, homopolymer extension is not applied
 
+To score many MSA row pairs when you only need the numbers, use `score_alignment_metrics()`: it returns the same metrics without building the visualization strings (see the API reference).
+
 ### Custom Adjustments
 
 ```python
@@ -348,6 +350,28 @@ blast_seq2 = "ATCGAAAAT"  # From BLAST output
 
 result = score_alignment(blast_seq1, blast_seq2)
 print(f"Adjusted identity: {result.identity:.3f}")
+```
+
+#### `score_alignment_metrics(seq1_aligned, seq2_aligned, adjustment_params=None)`
+
+**Metrics only** - same scoring as `score_alignment()`, without building the alignment and visualization strings. Use it when you only read the numbers, e.g. scoring every pair of rows in a multiple sequence alignment.
+
+**Guarantees:**
+- Every field equals the same-named field of `score_alignment()` for the same inputs and `AdjustmentParams` (whatever `score_alignment`'s `scoring_format` or `adjust_gaps`)
+- Same input validation (`ValueError` if the aligned sequences differ in length)
+- Pure and deterministic, so results can be cached on the two strings plus the (frozen, hashable) `AdjustmentParams`
+
+**Returns:**
+- `AlignmentMetrics`: `identity`, `mismatches`, `scored_positions`, `seq1_coverage`, `seq2_coverage`
+
+```python
+from itertools import combinations
+from adjusted_identity import score_alignment_metrics
+
+msa_rows = ["AGA--TTC", "AGAT-TTC", "AGA--TGC"]
+for a, b in combinations(msa_rows, 2):
+    m = score_alignment_metrics(a, b)
+    print(m.identity, m.mismatches)
 ```
 
 ### Convenience Function
@@ -442,6 +466,20 @@ AlignmentResult(
 ```
 
 **Note:** When `adjust_gaps=True`, the `seq1_aligned` and `seq2_aligned` strings are rewritten so gap positions match the scoring interpretation. This makes the `score_aligned` visualization directly interpretable position-by-position, but the output length may differ from the input alignment.
+
+#### `AlignmentMetrics`
+
+Returned by `score_alignment_metrics()`: the five metric fields of `AlignmentResult`, without the three strings.
+
+```python
+AlignmentMetrics(
+    identity=0.95,
+    mismatches=2,
+    scored_positions=40,
+    seq1_coverage=0.98,
+    seq2_coverage=0.97,
+)
+```
 
 ### Constants
 
